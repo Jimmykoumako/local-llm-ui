@@ -71,6 +71,10 @@ The binary and `.deb`/`.AppImage` will be in `src-tauri/target/release/bundle/`.
 
 This project uses [Semantic Versioning](https://semver.org/) and documents releases in [CHANGELOG.md](./CHANGELOG.md).
 
+See [docs/BRANCHING.md](./docs/BRANCHING.md) for the branch workflow (`main` = production, `dev` = integration, `feature/*` = work in progress).
+
+Planned features: [docs/ROADMAP.md](./docs/ROADMAP.md) · UI mockup prompts: [docs/stitch-prompts.md](./docs/stitch-prompts.md)
+
 ```bash
 # Tag a release after updating version in package.json, Cargo.toml, and CHANGELOG
 git tag -a v0.1.0 -m "v0.1.0"

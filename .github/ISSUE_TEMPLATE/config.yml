@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Roadmap
+    url: https://github.com/Jimmykoumako/local-llm-ui/blob/dev/docs/ROADMAP.md
+    about: See planned features before opening a request

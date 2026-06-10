@@ -1,0 +1,26 @@
+name: Feature request
+description: Suggest an improvement
+labels: enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+  - type: dropdown
+    id: roadmap
+    attributes:
+      label: Related roadmap item
+      options:
+        - Stop streaming
+        - Save conversation
+        - Processing time
+        - Markdown preview
+        - Settings view
+        - Generated image display
+        - Other
