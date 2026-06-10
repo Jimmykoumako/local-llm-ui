@@ -18,6 +18,7 @@ export interface AttachmentDisplay {
   label: string;
   previewUrl?: string;
   note?: string;
+  durationSecs?: number;
 }
 
 export interface PendingAttachment {
@@ -26,6 +27,16 @@ export interface PendingAttachment {
   label: string;
   previewUrl?: string;
   note?: string;
+  durationSecs?: number;
+}
+
+export interface ToolCallDisplay {
+  id?: string;
+  name: string;
+  arguments: Record<string, unknown> | string;
+  status?: "requested" | "running" | "completed" | "failed";
+  result?: string;
+  source?: "ollama" | "mcp";
 }
 
 export interface AudioPrepareResult {
@@ -41,7 +52,7 @@ export interface DisplayMessage {
   content: string;
   thinking?: string;
   attachments?: AttachmentDisplay[];
-  toolCalls?: unknown[];
+  toolCalls?: ToolCallDisplay[];
   streaming?: boolean;
 }
 

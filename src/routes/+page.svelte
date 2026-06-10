@@ -1,4 +1,6 @@
 <script lang="ts">
+  import AttachmentStrip from "$lib/components/AttachmentStrip.svelte";
+  import ChatBubble from "$lib/components/ChatBubble.svelte";
   import {
     checkOllama,
     formatAudioNote,
@@ -15,7 +17,10 @@
     DisplayMessage,
     ModelInfo,
     PendingAttachment,
+    ToolCallDisplay,
   } from "$lib/types";
+  import { wavBase64ToUrl } from "$lib/utils/audio";
+  import { parseToolCalls } from "$lib/utils/tools";
 
   const DEFAULT_AUDIO_PROMPT = "Transcribe this audio";
 
@@ -31,9 +36,10 @@
   let isStreaming = $state(false);
   let isPreparingAudio = $state(false);
   let errorMessage = $state("");
+  let messagesEnd = $state<HTMLDivElement | null>(null);
 
   const selectedModelInfo = $derived(
-    models.find((model) => model.name === selectedModel),
+    models.find((m) => m.name === selectedModel),
   );
   const supportsThinking = $derived(
     hasCapability(selectedModelInfo, "thinking"),
@@ -42,7 +48,7 @@
   const supportsTools = $derived(hasCapability(selectedModelInfo, "tools"));
   const supportsAudioInput = $derived(supportsAudio(selectedModelInfo));
   const hasPendingAudio = $derived(
-    pending.some((attachment) => attachment.kind === "audio"),
+    pending.some((a) => a.kind === "audio"),
   );
 
   async function refreshModels() {
@@ -67,6 +73,12 @@
     refreshModels();
   });
 
+  $effect(() => {
+    if (messages.length > 0) {
+      messagesEnd?.scrollIntoView({ behavior: "smooth" });
+    }
+  });
+
   function readFileAsBase64(file: File): Promise<string> {
     return new Promise((resolve, reject) => {
       const reader = new FileReader();
@@ -76,8 +88,7 @@
           reject(new Error("Failed to read image"));
           return;
         }
-        const base64 = result.split(",")[1] ?? result;
-        resolve(base64);
+        resolve(result.split(",")[1] ?? result);
       };
       reader.onerror = () =>
         reject(reader.error ?? new Error("Failed to read image"));
@@ -102,7 +113,6 @@
         },
       ];
     }
-
     target.value = "";
   }
 
@@ -123,7 +133,9 @@
             kind: "audio",
             base64: result.base64,
             label: file.name,
+            previewUrl: wavBase64ToUrl(result.base64),
             note: formatAudioNote(result),
+            durationSecs: result.duration_secs,
           },
         ];
       }
@@ -136,19 +148,12 @@
   }
 
   function removePending(index: number) {
-    const attachment = pending[index];
-    if (attachment.previewUrl) {
-      URL.revokeObjectURL(attachment.previewUrl);
-    }
     pending = pending.filter((_, i) => i !== index);
   }
 
   function attachmentsForOllama(items: PendingAttachment[]): string[] {
     return [...items]
-      .sort((a, b) => {
-        if (a.kind === b.kind) return 0;
-        return a.kind === "audio" ? -1 : 1;
-      })
+      .sort((a, b) => (a.kind === "audio" ? -1 : b.kind === "audio" ? 1 : 0))
       .map((item) => item.base64);
   }
 
@@ -160,6 +165,7 @@
       label: item.label,
       previewUrl: item.previewUrl,
       note: item.note,
+      durationSecs: item.durationSecs,
     }));
   }
 
@@ -178,22 +184,27 @@
     const messageContent =
       trimmed || (includesAudio ? DEFAULT_AUDIO_PROMPT : "");
 
-    const userMessage: DisplayMessage = {
-      id: crypto.randomUUID(),
-      role: "user",
-      content: messageContent,
-      attachments: attachmentsForDisplay(pending),
-    };
+    const sentAttachments = attachmentsForDisplay(pending);
 
-    const userHistory: ChatMessage = {
-      role: "user",
-      content: messageContent,
-      images:
-        pending.length > 0 ? attachmentsForOllama(pending) : undefined,
-    };
+    messages = [
+      ...messages,
+      {
+        id: crypto.randomUUID(),
+        role: "user",
+        content: messageContent,
+        attachments: sentAttachments,
+      },
+    ];
 
-    messages = [...messages, userMessage];
-    history = [...history, userHistory];
+    history = [
+      ...history,
+      {
+        role: "user",
+        content: messageContent,
+        images:
+          pending.length > 0 ? attachmentsForOllama(pending) : undefined,
+      },
+    ];
 
     input = "";
     pending = [];
@@ -216,7 +227,7 @@
 
     let thinking = "";
     let content = "";
-    let toolCalls: unknown[] = [];
+    let toolCalls: ToolCallDisplay[] = [];
 
     try {
       const unlisten = await streamChat(
@@ -228,35 +239,34 @@
           options: includesAudio ? { num_ctx: 8192 } : undefined,
         },
         (chunk) => {
-          if (chunk.error) {
-            errorMessage = chunk.error;
-          }
-          if (chunk.thinking) {
-            thinking += chunk.thinking;
-          }
-          if (chunk.content) {
-            content += chunk.content;
-          }
+          if (chunk.error) errorMessage = chunk.error;
+          if (chunk.thinking) thinking += chunk.thinking;
+          if (chunk.content) content += chunk.content;
           if (chunk.tool_calls?.length) {
-            toolCalls = chunk.tool_calls;
+            toolCalls = parseToolCalls(chunk.tool_calls).map((t) => ({
+              ...t,
+              status: "running" as const,
+            }));
           }
 
-          messages = messages.map((message) =>
-            message.id === assistantId
+          messages = messages.map((m) =>
+            m.id === assistantId
               ? {
-                  ...message,
+                  ...m,
                   thinking,
                   content,
                   toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
                 }
-              : message,
+              : m,
           );
 
-          if (chunk.done) {
-            isStreaming = false;
-          }
+          if (chunk.done) isStreaming = false;
         },
       );
+
+      if (toolCalls.length > 0) {
+        toolCalls = toolCalls.map((t) => ({ ...t, status: "completed" as const }));
+      }
 
       history = [
         ...history,
@@ -264,28 +274,37 @@
           role: "assistant",
           content,
           thinking: thinking || undefined,
-          tool_calls: toolCalls.length > 0 ? toolCalls : undefined,
+          tool_calls:
+            toolCalls.length > 0
+              ? toolCalls.map((t) => ({
+                  function: { name: t.name, arguments: t.arguments },
+                }))
+              : undefined,
         },
       ];
 
-      messages = messages.map((message) =>
-        message.id === assistantId
-          ? { ...message, streaming: false }
-          : message,
+      messages = messages.map((m) =>
+        m.id === assistantId
+          ? {
+              ...m,
+              streaming: false,
+              toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
+            }
+          : m,
       );
 
       await unlisten();
     } catch (error) {
       isStreaming = false;
       errorMessage = String(error);
-      messages = messages.map((message) =>
-        message.id === assistantId
+      messages = messages.map((m) =>
+        m.id === assistantId
           ? {
-              ...message,
+              ...m,
               content: "Failed to get a response.",
               streaming: false,
             }
-          : message,
+          : m,
       );
     }
   }
@@ -298,150 +317,140 @@
   }
 </script>
 
-<div class="app">
+<div class="shell">
   <aside class="sidebar">
-    <header>
-      <h1>Local LLM UI</h1>
-      <p class:online={connected} class:offline={!connected}>{statusMessage}</p>
-    </header>
-
-    <label>
-      Model
-      <select bind:value={selectedModel} disabled={!connected || isStreaming}>
-        {#each models as model}
-          <option value={model.name}>
-            {model.name} ({formatBytes(model.size)})
-          </option>
-        {/each}
-      </select>
-    </label>
-
-    {#if selectedModelInfo}
-      <div class="capabilities">
-        {#each selectedModelInfo.capabilities as capability}
-          <span class="badge">{capability}</span>
-        {/each}
+    <div class="sidebar-brand">
+      <div class="logo">LLM</div>
+      <div>
+        <h1>Local LLM UI</h1>
+        <p class="status" class:online={connected} class:offline={!connected}>
+          <span class="status-dot"></span>
+          {statusMessage}
+        </p>
       </div>
-    {/if}
-
-    <label class="toggle">
-      <input
-        type="checkbox"
-        bind:checked={thinkEnabled}
-        disabled={!supportsThinking || isStreaming}
-      />
-      Show thinking
-    </label>
-
-    <button class="secondary" onclick={refreshModels} disabled={isStreaming}>
-      Refresh models
-    </button>
-
-    <div class="hints">
-      <p>Vision: {supportsVision ? "supported" : "not available"}</p>
-      <p>Audio: {supportsAudioInput ? "supported · max 30s clip" : "not available"}</p>
-      <p>Tools: {supportsTools ? "display only (execution next)" : "not available"}</p>
     </div>
-  </aside>
 
-  <main class="chat">
-    <section class="messages">
-      {#if messages.length === 0}
-        <div class="empty">
-          <h2>Chat with your local models</h2>
-          <p>
-            Attach images for vision models, or audio for Gemma 4-style models.
-            Audio is converted to 16 kHz mono WAV (ffmpeg or built-in fallback) and trimmed to 30 seconds.
-          </p>
-        </div>
-      {/if}
+    <div class="sidebar-section">
+      <label class="field">
+        <span class="field-label">Model</span>
+        <select
+          bind:value={selectedModel}
+          disabled={!connected || isStreaming}
+        >
+          {#each models as model}
+            <option value={model.name}>
+              {model.name} ({formatBytes(model.size)})
+            </option>
+          {/each}
+        </select>
+      </label>
 
-      {#each messages as message (message.id)}
-        <article class="message" class:user={message.role === "user"}>
-          <header>{message.role === "user" ? "You" : "Assistant"}</header>
-
-          {#if message.attachments?.length}
-            <div class="attachments">
-              {#each message.attachments as attachment}
-                {#if attachment.kind === "image" && attachment.previewUrl}
-                  <img src={attachment.previewUrl} alt={attachment.label} />
-                {:else}
-                  <div class="audio-attachment">
-                    <span class="audio-chip" title={attachment.label}>
-                      🎤 {attachment.label}
-                    </span>
-                    {#if attachment.note}
-                      <span class="attachment-note">{attachment.note}</span>
-                    {/if}
-                  </div>
-                {/if}
-              {/each}
-            </div>
-          {/if}
-
-          {#if message.thinking}
-            <details class="thinking" open={message.streaming}>
-              <summary>Thinking</summary>
-              <pre>{message.thinking}</pre>
-            </details>
-          {/if}
-
-          {#if message.toolCalls?.length}
-            <div class="tools">
-              <strong>Tool calls</strong>
-              <pre>{JSON.stringify(message.toolCalls, null, 2)}</pre>
-            </div>
-          {/if}
-
-          {#if message.content}
-            <p class="content">{message.content}</p>
-          {:else if message.streaming}
-            <p class="content muted">Waiting for response…</p>
-          {/if}
-        </article>
-      {/each}
-    </section>
-
-    {#if errorMessage}
-      <div class="error">{errorMessage}</div>
-    {/if}
-
-    <footer class="composer">
-      {#if pending.length > 0}
-        <div class="pending-attachments">
-          {#each pending as attachment, index}
-            <div class="pending-item">
-              {#if attachment.kind === "image" && attachment.previewUrl}
-                <img src={attachment.previewUrl} alt={attachment.label} />
-              {:else}
-                <div class="audio-attachment">
-                  <span class="audio-chip">🎤 {attachment.label}</span>
-                  {#if attachment.note}
-                    <span class="attachment-note">{attachment.note}</span>
-                  {/if}
-                </div>
-              {/if}
-              <button
-                type="button"
-                onclick={() => removePending(index)}
-                aria-label="Remove attachment"
-                disabled={isStreaming || isPreparingAudio}
-              >
-                ×
-              </button>
-            </div>
+      {#if selectedModelInfo?.capabilities.length}
+        <div class="badges">
+          {#each selectedModelInfo.capabilities as cap}
+            <span class="badge">{cap}</span>
           {/each}
         </div>
       {/if}
+    </div>
+
+    <div class="sidebar-section">
+      <label class="check">
+        <input
+          type="checkbox"
+          bind:checked={thinkEnabled}
+          disabled={!supportsThinking || isStreaming}
+        />
+        Show thinking
+      </label>
+      <button
+        type="button"
+        class="btn btn-ghost"
+        onclick={refreshModels}
+        disabled={isStreaming}
+      >
+        Refresh models
+      </button>
+    </div>
+
+    <div class="sidebar-section tools-info">
+      <h2 class="section-title">Capabilities</h2>
+      <ul class="cap-list">
+        <li class:ok={supportsVision}>
+          <span>Vision</span>
+          <span>{supportsVision ? "on" : "off"}</span>
+        </li>
+        <li class:ok={supportsAudioInput}>
+          <span>Audio</span>
+          <span>{supportsAudioInput ? "30s max" : "off"}</span>
+        </li>
+        <li class:ok={supportsTools}>
+          <span>Tools / MCP</span>
+          <span>{supportsTools ? "display" : "off"}</span>
+        </li>
+      </ul>
+      {#if supportsTools}
+        <p class="hint">
+          Tool & MCP calls appear as structured cards in chat. Execution loop
+          coming in v0.3.
+        </p>
+      {/if}
+    </div>
+  </aside>
+
+  <div class="main">
+    <div class="thread-scroll">
+      <div class="thread">
+        {#if messages.length === 0}
+          <div class="empty">
+            <h2>Chat with local models</h2>
+            <p>
+              Attach images for vision models or audio for Gemma 4. Audio
+              includes playback controls; images open in a preview lightbox.
+            </p>
+          </div>
+        {:else}
+          {#each messages as message (message.id)}
+            <div
+              class="row"
+              class:user={message.role === "user"}
+              class:assistant={message.role === "assistant"}
+            >
+              <ChatBubble
+                role={message.role}
+                content={message.content}
+                thinking={message.thinking}
+                attachments={message.attachments}
+                toolCalls={message.toolCalls}
+                streaming={message.streaming}
+                showThinking={thinkEnabled}
+              />
+            </div>
+          {/each}
+          <div bind:this={messagesEnd}></div>
+        {/if}
+      </div>
+    </div>
+
+    {#if errorMessage}
+      <div class="error-banner" role="alert">{errorMessage}</div>
+    {/if}
+
+    <footer class="composer">
+      <AttachmentStrip
+        items={pending}
+        onRemove={removePending}
+        disabled={isStreaming || isPreparingAudio}
+      />
 
       {#if isPreparingAudio}
         <p class="preparing">Converting audio to 16 kHz WAV…</p>
       {/if}
 
-      <div class="composer-row">
-        <div class="attach-group">
+      <div class="composer-inner">
+        <div class="composer-actions">
           {#if supportsVision}
-            <label class="attach">
+            <label class="btn btn-ghost attach-btn">
               <input
                 type="file"
                 accept="image/*"
@@ -449,12 +458,14 @@
                 onchange={onImageSelected}
                 disabled={isStreaming || isPreparingAudio}
               />
+              <svg width="18" height="18" viewBox="0 0 18 18" fill="currentColor" aria-hidden="true">
+                <path d="M2 4a2 2 0 012-2h8l4 4v8a2 2 0 01-2 2H4a2 2 0 01-2-2V4zm10 0v3h3M6 10l2.5-3 2 2.5L13 8" stroke="currentColor" stroke-width="1.2" fill="none"/>
+              </svg>
               Image
             </label>
           {/if}
-
           {#if supportsAudioInput}
-            <label class="attach">
+            <label class="btn btn-ghost attach-btn">
               <input
                 type="file"
                 accept="audio/*,.mp3,.wav,.ogg,.flac,.m4a,.aac,.webm"
@@ -462,310 +473,377 @@
                 onchange={onAudioSelected}
                 disabled={isStreaming || isPreparingAudio}
               />
+              <svg width="18" height="18" viewBox="0 0 18 18" fill="currentColor" aria-hidden="true">
+                <path d="M9 1a3 3 0 00-3 3v5a3 3 0 006 0V4a3 3 0 00-3-3zm-5 8a5 5 0 0010 0h2a7 7 0 01-14 0h2zm3 0H6a3 3 0 006 0h-1a2 2 0 11-4 0H7z"/>
+              </svg>
               Audio
             </label>
           {/if}
         </div>
 
         <textarea
+          class="composer-input"
           bind:value={input}
           placeholder={hasPendingAudio
             ? "Optional prompt (defaults to “Transcribe this audio”)…"
             : "Message the model…"}
-          rows="3"
+          rows="2"
           onkeydown={onKeydown}
           disabled={!connected || isStreaming || isPreparingAudio}
         ></textarea>
 
         <button
+          type="button"
+          class="btn btn-primary send-btn"
           onclick={sendMessage}
           disabled={!connected || isStreaming || isPreparingAudio}
         >
-          {isStreaming ? "Streaming…" : isPreparingAudio ? "Converting…" : "Send"}
+          {#if isStreaming}
+            Streaming…
+          {:else if isPreparingAudio}
+            Converting…
+          {:else}
+            Send
+          {/if}
         </button>
       </div>
     </footer>
-  </main>
+  </div>
 </div>
 
 <style>
-  .app {
+  .shell {
     display: grid;
-    grid-template-columns: 280px 1fr;
+    grid-template-columns: var(--sidebar-width) 1fr;
     height: 100vh;
+    width: 100vw;
+    overflow: hidden;
+    background: var(--color-bg);
   }
 
+  /* Sidebar */
   .sidebar {
-    padding: 1.25rem;
-    border-right: 1px solid #2a2f3a;
-    background: #151821;
     display: flex;
     flex-direction: column;
-    gap: 1rem;
+    gap: var(--space-5);
+    padding: var(--space-5);
+    background: var(--color-bg-elevated);
+    border-right: 1px solid var(--color-border);
+    overflow-y: auto;
   }
 
-  .sidebar h1 {
+  .sidebar-brand {
+    display: flex;
+    gap: var(--space-3);
+    align-items: center;
+  }
+
+  .logo {
+    width: 40px;
+    height: 40px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: var(--radius-md);
+    background: var(--color-primary);
+    font-weight: 700;
+    font-size: var(--text-sm);
+  }
+
+  .sidebar-brand h1 {
     margin: 0;
-    font-size: 1.1rem;
+    font-size: var(--text-base);
+    font-weight: 600;
   }
 
-  .online {
-    color: #7dcea0;
+  .status {
+    margin: var(--space-1) 0 0;
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    font-size: var(--text-xs);
+    color: var(--color-text-muted);
   }
 
-  .offline {
-    color: #f1948a;
+  .status-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: var(--radius-full);
+    background: var(--color-text-muted);
   }
 
-  label {
+  .status.online .status-dot {
+    background: var(--color-success);
+    box-shadow: 0 0 6px var(--color-success);
+  }
+
+  .status.offline .status-dot {
+    background: var(--color-error);
+  }
+
+  .sidebar-section {
     display: flex;
     flex-direction: column;
-    gap: 0.4rem;
-    font-size: 0.85rem;
-    color: #b8bec8;
+    gap: var(--space-3);
   }
 
-  select,
-  textarea,
-  button,
-  .attach {
-    border-radius: 10px;
-    border: 1px solid #2f3642;
-    background: #0f1117;
-    color: inherit;
-    font: inherit;
+  .section-title {
+    margin: 0;
+    font-size: var(--text-xs);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--color-text-muted);
+  }
+
+  .field {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+
+  .field-label {
+    font-size: var(--text-xs);
+    color: var(--color-text-secondary);
   }
 
   select,
   textarea {
-    padding: 0.75rem;
+    background: var(--color-bg-inset);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-md);
+    padding: var(--space-3);
+    color: var(--color-text);
   }
 
-  button {
-    padding: 0.75rem 1rem;
-    cursor: pointer;
-    background: #3d5afe;
-    border-color: #3d5afe;
+  select:focus,
+  textarea:focus {
+    outline: 2px solid var(--color-primary);
+    outline-offset: 1px;
   }
 
-  button:disabled {
-    opacity: 0.6;
-    cursor: not-allowed;
-  }
-
-  button.secondary {
-    background: #1f2430;
-    border-color: #2f3642;
-  }
-
-  .toggle {
-    flex-direction: row;
-    align-items: center;
-    gap: 0.5rem;
-  }
-
-  .capabilities {
+  .badges {
     display: flex;
     flex-wrap: wrap;
-    gap: 0.4rem;
+    gap: var(--space-2);
   }
 
   .badge {
-    font-size: 0.75rem;
-    padding: 0.2rem 0.5rem;
-    border-radius: 999px;
-    background: #243042;
+    font-size: var(--text-xs);
+    padding: 2px 8px;
+    border-radius: var(--radius-full);
+    background: rgba(79, 106, 245, 0.12);
     color: #9ec5ff;
+    border: 1px solid rgba(79, 106, 245, 0.2);
   }
 
-  .hints {
-    margin-top: auto;
-    font-size: 0.8rem;
-    color: #8b93a1;
+  .check {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    font-size: var(--text-sm);
+    color: var(--color-text-secondary);
+    cursor: pointer;
   }
 
-  .chat {
-    display: grid;
-    grid-template-rows: 1fr auto;
-    min-width: 0;
-  }
-
-  .messages {
-    overflow-y: auto;
-    padding: 1.5rem;
+  .cap-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
     display: flex;
     flex-direction: column;
-    gap: 1rem;
+    gap: var(--space-2);
+  }
+
+  .cap-list li {
+    display: flex;
+    justify-content: space-between;
+    font-size: var(--text-sm);
+    color: var(--color-text-muted);
+    padding: var(--space-2) var(--space-3);
+    border-radius: var(--radius-sm);
+    background: var(--color-bg-inset);
+  }
+
+  .cap-list li.ok span:last-child {
+    color: var(--color-success);
+  }
+
+  .tools-info {
+    margin-top: auto;
+  }
+
+  .hint {
+    margin: 0;
+    font-size: var(--text-xs);
+    color: var(--color-text-muted);
+    line-height: 1.4;
+  }
+
+  /* Main chat */
+  .main {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    min-height: 0;
+    background: var(--color-bg);
+  }
+
+  .thread-scroll {
+    flex: 1;
+    overflow-y: auto;
+    min-height: 0;
+  }
+
+  .thread {
+    max-width: calc(var(--thread-max-width) + var(--space-8) * 2);
+    margin: 0 auto;
+    padding: var(--space-6) var(--space-4);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-4);
+    width: 100%;
+  }
+
+  .row {
+    display: flex;
+    width: 100%;
+  }
+
+  .row.user {
+    justify-content: flex-end;
+  }
+
+  .row.assistant {
+    justify-content: flex-start;
+  }
+
+  .row :global(.bubble) {
+    max-width: 100%;
+  }
+
+  .row.user :global(.bubble) {
+    max-width: min(100%, 560px);
   }
 
   .empty {
     margin: auto;
+    padding: var(--space-8) var(--space-4);
     text-align: center;
-    color: #8b93a1;
-    max-width: 480px;
+    max-width: 420px;
   }
 
-  .message {
-    max-width: 820px;
-    padding: 1rem;
-    border-radius: 14px;
-    background: #171b24;
-    border: 1px solid #2a2f3a;
+  .empty h2 {
+    margin: 0 0 var(--space-3);
+    font-size: var(--text-lg);
+    font-weight: 600;
   }
 
-  .message.user {
-    align-self: flex-end;
-    background: #1d2a44;
-  }
-
-  .message header {
-    font-size: 0.8rem;
-    color: #9aa3b2;
-    margin-bottom: 0.5rem;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-  }
-
-  .content {
+  .empty p {
     margin: 0;
-    white-space: pre-wrap;
+    color: var(--color-text-secondary);
+    font-size: var(--text-sm);
+    line-height: 1.6;
+  }
+
+  .error-banner {
+    flex-shrink: 0;
+    margin: 0 var(--space-4) var(--space-2);
+    padding: var(--space-3) var(--space-4);
+    border-radius: var(--radius-md);
+    background: var(--color-error-bg);
+    border: 1px solid rgba(248, 113, 113, 0.35);
+    color: var(--color-error);
+    font-size: var(--text-sm);
+  }
+
+  /* Composer */
+  .composer {
+    flex-shrink: 0;
+    padding: var(--space-4);
+    border-top: 1px solid var(--color-border);
+    background: var(--color-bg-elevated);
+  }
+
+  .composer-inner {
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    gap: var(--space-3);
+    align-items: flex-end;
+    max-width: calc(var(--thread-max-width) + var(--space-8) * 2);
+    margin: 0 auto;
+  }
+
+  .composer-actions {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+
+  .composer-input {
+    resize: none;
+    min-height: 52px;
+    max-height: 160px;
     line-height: 1.5;
   }
 
-  .muted {
-    color: #8b93a1;
-  }
-
-  .thinking,
-  .tools {
-    margin-bottom: 0.75rem;
-    padding: 0.75rem;
-    border-radius: 10px;
-    background: #10141d;
-    border: 1px solid #2a2f3a;
-  }
-
-  .thinking summary,
-  .tools strong {
-    cursor: pointer;
-    color: #c7b3ff;
-  }
-
-  pre {
-    margin: 0.5rem 0 0;
-    white-space: pre-wrap;
-    word-break: break-word;
-    font-size: 0.85rem;
-    color: #d6d9df;
-  }
-
-  .attachments,
-  .pending-attachments {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0.5rem;
-    margin-bottom: 0.75rem;
-  }
-
-  .attachments img,
-  .pending-item img {
-    width: 96px;
-    height: 96px;
-    object-fit: cover;
-    border-radius: 10px;
-    border: 1px solid #2f3642;
-  }
-
-  .audio-attachment {
-    display: flex;
-    flex-direction: column;
-    gap: 0.25rem;
-    max-width: 260px;
-  }
-
-  .audio-chip {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.35rem;
-    padding: 0.5rem 0.75rem;
-    border-radius: 10px;
-    background: #1a2333;
-    border: 1px solid #2f3642;
-    font-size: 0.85rem;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .attachment-note {
-    font-size: 0.75rem;
-    color: #8b93a1;
-  }
-
-  .pending-item {
-    position: relative;
-  }
-
-  .pending-item button {
-    position: absolute;
-    top: 4px;
-    right: 4px;
-    width: 24px;
-    height: 24px;
-    padding: 0;
-    border-radius: 999px;
-    background: #11151d;
-  }
-
   .preparing {
-    margin: 0 0 0.5rem;
-    font-size: 0.85rem;
-    color: #9ec5ff;
+    max-width: calc(var(--thread-max-width) + var(--space-8) * 2);
+    margin: 0 auto var(--space-2);
+    font-size: var(--text-sm);
+    color: var(--color-tool);
   }
 
-  .error {
-    margin: 0 1.5rem;
-    padding: 0.75rem 1rem;
-    border-radius: 10px;
-    background: #3b1f24;
-    color: #ffb4b4;
-    border: 1px solid #6d2d36;
-  }
-
-  .composer {
-    padding: 1rem 1.5rem 1.5rem;
-    border-top: 1px solid #2a2f3a;
-    background: #12151c;
-  }
-
-  .composer-row {
-    display: grid;
-    grid-template-columns: auto 1fr auto;
-    gap: 0.75rem;
-    align-items: end;
-  }
-
-  .attach-group {
-    display: flex;
-    flex-direction: column;
-    gap: 0.5rem;
-  }
-
-  .attach {
+  /* Buttons */
+  .btn {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    padding: 0.75rem 1rem;
-    cursor: pointer;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-4);
+    border-radius: var(--radius-md);
+    border: 1px solid transparent;
+    font-size: var(--text-sm);
+    font-weight: 500;
     white-space: nowrap;
   }
 
-  .attach input {
-    display: none;
+  .btn-primary {
+    background: var(--color-primary);
+    color: white;
+    border-color: var(--color-primary);
+    min-width: 88px;
+    padding: var(--space-3) var(--space-5);
   }
 
-  textarea {
-    resize: vertical;
-    min-height: 72px;
+  .btn-primary:hover:not(:disabled) {
+    background: var(--color-primary-hover);
+  }
+
+  .btn-ghost {
+    background: var(--color-bg-inset);
+    border-color: var(--color-border);
+    color: var(--color-text-secondary);
+  }
+
+  .btn-ghost:hover:not(:disabled) {
+    background: var(--color-bg-hover);
+    color: var(--color-text);
+  }
+
+  .attach-btn {
+    cursor: pointer;
+    position: relative;
+  }
+
+  .attach-btn input {
+    position: absolute;
+    width: 0;
+    height: 0;
+    opacity: 0;
+  }
+
+  .send-btn {
+    align-self: stretch;
   }
 </style>

@@ -1,4 +1,6 @@
 <script lang="ts">
+  import "$lib/styles/global.css";
+
   let { children } = $props();
 </script>
 
@@ -7,22 +9,3 @@
 </svelte:head>
 
 {@render children()}
-
-<style>
-  :global(*) {
-    box-sizing: border-box;
-  }
-
-  :global(body) {
-    margin: 0;
-    font-family:
-      Inter,
-      system-ui,
-      -apple-system,
-      BlinkMacSystemFont,
-      "Segoe UI",
-      sans-serif;
-    background: #0f1117;
-    color: #e8eaed;
-  }
-</style>
