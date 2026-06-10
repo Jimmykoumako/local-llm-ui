@@ -1,7 +1,9 @@
 use futures_util::StreamExt;
 use reqwest::Client;
 use tauri::{Emitter, Window};
+use tokio::select;
 
+use super::sessions::{cancel as cancel_session, register, remove};
 use super::types::{parse_stream_line, ChatChunk, ChatRequest, ModelInfo, ShowResponse, TagsResponse};
 
 const OLLAMA_BASE: &str = "http://127.0.0.1:11434";
@@ -15,6 +17,14 @@ fn format_chat_error(status: u16, body: &str) -> String {
     }
 
     format!("Ollama chat error ({status}): {body}")
+}
+
+pub fn cancel_chat(session_id: String) -> Result<(), String> {
+    if cancel_session(&session_id) {
+        Ok(())
+    } else {
+        Err(format!("No active stream for session {session_id}"))
+    }
 }
 
 pub async fn check_connection() -> Result<(), String> {
@@ -76,7 +86,27 @@ async fn fetch_capabilities(client: &Client, model: &str) -> Result<Vec<String>,
     Ok(response.capabilities)
 }
 
+fn emit_cancelled(window: &Window, event_name: &str) -> Result<(), String> {
+    window
+        .emit(
+            event_name,
+            &ChatChunk {
+                thinking: None,
+                content: None,
+                tool_calls: None,
+                done: true,
+                cancelled: Some(true),
+                error: None,
+            },
+        )
+        .map_err(|e| format!("Failed to emit cancel chunk: {e}"))
+}
+
 pub async fn stream_chat(window: Window, request: ChatRequest) -> Result<(), String> {
+    let session_id = request.session_id.clone();
+    let event_name = format!("chat-chunk-{session_id}");
+    let cancel_token = register(&session_id);
+
     let client = Client::new();
     let response = client
         .post(format!("{OLLAMA_BASE}/api/chat"))
@@ -86,6 +116,7 @@ pub async fn stream_chat(window: Window, request: ChatRequest) -> Result<(), Str
         .map_err(|e| format!("Chat request failed: {e}"))?;
 
     if !response.status().is_success() {
+        remove(&session_id);
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         return Err(format_chat_error(status.as_u16(), &body));
@@ -93,12 +124,40 @@ pub async fn stream_chat(window: Window, request: ChatRequest) -> Result<(), Str
 
     let mut byte_stream = response.bytes_stream();
     let mut buffer = String::new();
+    let mut was_cancelled = false;
 
-    while let Some(chunk) = byte_stream.next().await {
+    loop {
+        if cancel_token.is_cancelled() {
+            was_cancelled = true;
+            break;
+        }
+
+        let chunk_result = select! {
+            biased;
+            _ = cancel_token.cancelled() => {
+                was_cancelled = true;
+                break;
+            }
+            next = byte_stream.next() => next,
+        };
+
+        let Some(chunk) = chunk_result else {
+            break;
+        };
+
         let chunk = chunk.map_err(|e| format!("Stream read failed: {e}"))?;
+        if chunk.is_empty() {
+            continue;
+        }
+
         buffer.push_str(&String::from_utf8_lossy(&chunk));
 
         while let Some(newline_idx) = buffer.find('\n') {
+            if cancel_token.is_cancelled() {
+                was_cancelled = true;
+                break;
+            }
+
             let line = buffer[..newline_idx].trim().to_string();
             buffer.drain(..=newline_idx);
 
@@ -113,32 +172,44 @@ pub async fn stream_chat(window: Window, request: ChatRequest) -> Result<(), Str
                     content: None,
                     tool_calls: None,
                     done: true,
+                    cancelled: None,
                     error: Some(error),
                 },
             };
 
             window
-                .emit("chat-chunk", &chat_chunk)
+                .emit(&event_name, &chat_chunk)
                 .map_err(|e| format!("Failed to emit chat chunk: {e}"))?;
 
             if chat_chunk.done {
+                remove(&session_id);
                 return Ok(());
             }
         }
+
+        if was_cancelled {
+            break;
+        }
     }
 
-    window
-        .emit(
-            "chat-chunk",
-            &ChatChunk {
-                thinking: None,
-                content: None,
-                tool_calls: None,
-                done: true,
-                error: None,
-            },
-        )
-        .map_err(|e| format!("Failed to emit final chunk: {e}"))?;
+    if was_cancelled {
+        emit_cancelled(&window, &event_name)?;
+    } else {
+        window
+            .emit(
+                &event_name,
+                &ChatChunk {
+                    thinking: None,
+                    content: None,
+                    tool_calls: None,
+                    done: true,
+                    cancelled: Some(false),
+                    error: None,
+                },
+            )
+            .map_err(|e| format!("Failed to emit final chunk: {e}"))?;
+    }
 
+    remove(&session_id);
     Ok(())
 }

@@ -6,7 +6,7 @@ export interface ModelInfo {
 
 export interface ChatMessage {
   role: "user" | "assistant" | "system" | "tool";
-  content: string;
+  content?: string;
   thinking?: string;
   images?: string[];
   tool_calls?: unknown[];
@@ -36,7 +36,7 @@ export interface ToolCallDisplay {
   arguments: Record<string, unknown> | string;
   status?: "requested" | "running" | "completed" | "failed";
   result?: string;
-  source?: "ollama" | "mcp";
+  source?: "ollama" | "mcp" | "agent";
 }
 
 export interface AudioPrepareResult {
@@ -51,6 +51,7 @@ export interface DisplayMessage {
   role: "user" | "assistant";
   content: string;
   thinking?: string;
+  thinkingDurationMs?: number;
   attachments?: AttachmentDisplay[];
   toolCalls?: ToolCallDisplay[];
   streaming?: boolean;
@@ -61,10 +62,12 @@ export interface ChatChunk {
   content?: string;
   tool_calls?: unknown[];
   done: boolean;
+  cancelled?: boolean;
   error?: string;
 }
 
 export interface ChatRequest {
+  sessionId: string;
   model: string;
   messages: ChatMessage[];
   think?: boolean | string;

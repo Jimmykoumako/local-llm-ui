@@ -1,9 +1,12 @@
 <script lang="ts">
+  import AgentTurn from "./AgentTurn.svelte";
   import AudioPlayer from "./AudioPlayer.svelte";
   import ImagePreview from "./ImagePreview.svelte";
   import MarkdownContent from "./MarkdownContent.svelte";
   import ToolCallPanel from "./ToolCallPanel.svelte";
   import type { AttachmentDisplay, ToolCallDisplay } from "$lib/types";
+  import MessageActions from "./MessageActions.svelte";
+  import { enrichAssistantContentWithSearchFiles } from "$lib/utils/tool-results";
 
   interface Props {
     role: "user" | "assistant";
@@ -11,8 +14,23 @@
     thinking?: string;
     attachments?: AttachmentDisplay[];
     toolCalls?: ToolCallDisplay[];
+    contextToolCalls?: ToolCallDisplay[];
     streaming?: boolean;
     showThinking?: boolean;
+    agentLayout?: boolean;
+    thinkingDurationMs?: number;
+    messageId?: string;
+    ttsEnabled?: boolean;
+    onSpeak?: () => void;
+    onStopSpeak?: () => void;
+    onSpeakBlock?: (text: string, blockKey: string) => void;
+    speaking?: boolean;
+    speakingBlockKey?: string | null;
+    allowBlockDownload?: boolean;
+    tagged?: boolean;
+    onCopy?: () => void;
+    onBranch?: () => void;
+    onToggleTag?: () => void;
   }
 
   let {
@@ -21,37 +39,85 @@
     thinking = "",
     attachments = [],
     toolCalls = [],
+    contextToolCalls = [],
     streaming = false,
     showThinking = true,
+    agentLayout = false,
+    thinkingDurationMs,
+    messageId = "",
+    ttsEnabled = false,
+    onSpeak,
+    onStopSpeak,
+    onSpeakBlock,
+    speaking = false,
+    speakingBlockKey = null,
+    allowBlockDownload = false,
+    tagged = false,
+    onCopy,
+    onBranch,
+    onToggleTag,
   }: Props = $props();
 
   let thinkingOpen = $state(true);
-  let contentMode = $state<"preview" | "raw">("preview");
+  let wasStreaming = $state(false);
+  $effect(() => {
+    if (wasStreaming && !streaming) {
+      thinkingOpen = false;
+    }
+    wasStreaming = streaming;
+  });
 
   const isUser = $derived(role === "user");
   const hasThinking = $derived(Boolean(thinking?.trim()));
   const hasTools = $derived(toolCalls.length > 0);
+
+  const displayContent = $derived.by(() => {
+    if (isUser || streaming || !content.trim()) return content;
+    const tools = [...contextToolCalls, ...toolCalls];
+    return enrichAssistantContentWithSearchFiles(content, tools);
+  });
 </script>
 
+{#if !isUser && agentLayout}
+  <AgentTurn
+    {content}
+    {thinking}
+    {toolCalls}
+    {contextToolCalls}
+    {streaming}
+    {showThinking}
+    {thinkingDurationMs}
+    {ttsEnabled}
+    {onSpeak}
+    {onStopSpeak}
+    {onSpeakBlock}
+    allowBlockDownload={allowBlockDownload}
+    {tagged}
+    {onCopy}
+    {onBranch}
+    {onToggleTag}
+    speaking={speaking || Boolean(speakingBlockKey)}
+    {speakingBlockKey}
+  />
+{:else}
 <article class="bubble" class:user={isUser} class:assistant={!isUser}>
   <header class="meta">
     <span class="role">{isUser ? "You" : "Assistant"}</span>
     {#if streaming && !isUser}
       <span class="streaming-dot" aria-label="Streaming"></span>
     {/if}
-    {#if !isUser && content.trim()}
-      <div class="mode-toggle">
-        <button
-          type="button"
-          class:active={contentMode === "preview"}
-          onclick={() => (contentMode = "preview")}
-        >Preview</button>
-        <button
-          type="button"
-          class:active={contentMode === "raw"}
-          onclick={() => (contentMode = "raw")}
-        >Raw</button>
-      </div>
+    {#if content.trim() && !streaming}
+      <MessageActions
+        {ttsEnabled}
+        {speaking}
+        {tagged}
+        showTts={!isUser}
+        {onCopy}
+        {onBranch}
+        {onSpeak}
+        {onStopSpeak}
+        {onToggleTag}
+      />
     {/if}
   </header>
 
@@ -83,7 +149,11 @@
         {/if}
       </summary>
       <div class="thinking-body">
-        <MarkdownContent content={thinking} raw={false} />
+        {#if streaming}
+          <pre class="thinking-stream">{thinking}</pre>
+        {:else}
+          <MarkdownContent content={thinking} raw={false} />
+        {/if}
       </div>
     </details>
   {/if}
@@ -93,11 +163,19 @@
   {/if}
 
   <div class="body">
-    {#if content.trim()}
+    {#if displayContent.trim()}
       {#if isUser}
-        <p class="user-text">{content}</p>
+        <p class="user-text">{displayContent}</p>
       {:else}
-        <MarkdownContent {content} raw={contentMode === "raw"} />
+        <MarkdownContent
+          content={displayContent}
+          {ttsEnabled}
+          allowDownload={allowBlockDownload}
+          {onSpeakBlock}
+          {onStopSpeak}
+          speaking={speaking || Boolean(speakingBlockKey)}
+          {speakingBlockKey}
+        />
       {/if}
     {:else if streaming}
       <p class="placeholder">
@@ -107,6 +185,7 @@
     {/if}
   </div>
 </article>
+{/if}
 
 <style>
   .bubble {
@@ -148,29 +227,6 @@
 
   @keyframes blink {
     50% { opacity: 0.3; }
-  }
-
-  .mode-toggle {
-    margin-left: auto;
-    display: flex;
-    gap: 2px;
-    padding: 2px;
-    background: var(--color-bg-inset);
-    border-radius: var(--radius-sm);
-  }
-
-  .mode-toggle button {
-    padding: 2px 8px;
-    border: none;
-    border-radius: 4px;
-    background: transparent;
-    font-size: var(--text-xs);
-    color: var(--color-text-muted);
-  }
-
-  .mode-toggle button.active {
-    background: var(--color-bg-hover);
-    color: var(--color-text);
   }
 
   .attachments {
@@ -221,6 +277,16 @@
     color: var(--color-text-secondary);
     max-height: 280px;
     overflow-y: auto;
+  }
+
+  .thinking-stream {
+    margin: 0;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: var(--font-sans);
+    font-size: var(--text-sm);
+    line-height: 1.6;
+    color: var(--color-text-secondary);
   }
 
   .body {

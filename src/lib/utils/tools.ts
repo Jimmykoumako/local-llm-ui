@@ -14,7 +14,16 @@ function parseArguments(raw: unknown): Record<string, unknown> | string {
   return {};
 }
 
-function inferSource(name: string): "mcp" | "ollama" {
+const AGENT_TOOL_NAMES = new Set([
+  "read_file", "write_file", "create_file", "create_directory",
+  "list_directory", "delete_path", "move_path", "copy_path", "stat_file",
+  "search_files", "search_content", "run_terminal", "get_agent_capabilities",
+  "git_status", "git_diff", "git_log", "git_branch_list",
+  "git_add", "git_commit", "git_checkout", "git_pull", "git_push",
+]);
+
+function inferSource(name: string): "mcp" | "ollama" | "agent" {
+  if (AGENT_TOOL_NAMES.has(name)) return "agent";
   const lower = name.toLowerCase();
   if (
     lower.startsWith("mcp_") ||
@@ -65,4 +74,39 @@ export function formatToolArguments(
 ): string {
   if (typeof args === "string") return args;
   return JSON.stringify(args, null, 2);
+}
+
+/** Ollama expects tool call arguments as objects, not JSON strings. */
+export function normalizeToolArguments(
+  args: Record<string, unknown> | string,
+): Record<string, unknown> {
+  if (args && typeof args === "object" && !Array.isArray(args)) {
+    return args;
+  }
+  if (typeof args === "string") {
+    try {
+      const parsed: unknown = JSON.parse(args);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
+    } catch {
+      /* use empty object below */
+    }
+  }
+  return {};
+}
+
+/** Format tool calls for Ollama /api/chat follow-up requests. */
+export function toolCallsForOllamaHistory(
+  tools: ToolCallDisplay[],
+): Record<string, unknown>[] {
+  return tools.map((tool, index) => ({
+    type: "function",
+    ...(tool.id ? { id: tool.id } : {}),
+    function: {
+      index,
+      name: tool.name,
+      arguments: normalizeToolArguments(tool.arguments),
+    },
+  }));
 }

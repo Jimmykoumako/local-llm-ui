@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { listen } from "@tauri-apps/api/event";
 import type {
   AudioPrepareResult,
   ChatChunk,
@@ -15,16 +15,32 @@ export async function listModels(): Promise<ModelInfo[]> {
   return invoke<ModelInfo[]>("ollama_list_models");
 }
 
+export async function cancelChat(sessionId: string): Promise<void> {
+  await invoke("ollama_chat_cancel", { sessionId });
+}
+
 export async function streamChat(
-  request: ChatRequest,
+  sessionId: string,
+  request: Omit<ChatRequest, "sessionId">,
   onChunk: (chunk: ChatChunk) => void,
-): Promise<UnlistenFn> {
-  const unlisten = await listen<ChatChunk>("chat-chunk", (event) => {
+): Promise<{ cancelled: boolean }> {
+  const channel = `chat-chunk-${sessionId}`;
+  let cancelled = false;
+
+  const unlisten = await listen<ChatChunk>(channel, (event) => {
+    if (event.payload.cancelled) cancelled = true;
     onChunk(event.payload);
   });
 
-  await invoke("ollama_chat", { request });
-  return unlisten;
+  try {
+    await invoke("ollama_chat", {
+      request: { ...request, sessionId },
+    });
+  } finally {
+    unlisten();
+  }
+
+  return { cancelled };
 }
 
 export function hasCapability(

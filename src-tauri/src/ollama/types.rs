@@ -11,7 +11,7 @@ pub struct ModelInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<String>,
@@ -25,6 +25,9 @@ pub struct ChatMessage {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatRequest {
+    #[serde(rename = "sessionId")]
+    #[serde(skip_serializing)]
+    pub session_id: String,
     pub model: String,
     pub messages: Vec<ChatMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -47,6 +50,7 @@ pub struct ChatChunk {
     pub content: Option<String>,
     pub tool_calls: Option<Vec<Value>>,
     pub done: bool,
+    pub cancelled: Option<bool>,
     pub error: Option<String>,
 }
 
@@ -73,6 +77,8 @@ pub struct ShowResponse {
 struct StreamLine {
     message: Option<StreamMessage>,
     done: bool,
+    #[serde(default)]
+    done_reason: Option<String>,
     error: Option<String>,
 }
 
@@ -91,12 +97,30 @@ impl StreamLine {
             tool_calls: None,
         });
 
+        let mut error = self.error;
+        if self.done && error.is_none() {
+            if matches!(self.done_reason.as_deref(), Some("length")) {
+                error = Some(
+                    "Response stopped early: output token limit reached. \
+                     Try a new chat, a larger model, or increase num_predict."
+                        .to_string(),
+                );
+            } else if matches!(self.done_reason.as_deref(), Some("load")) {
+                error = Some(
+                    "Response stopped early: prompt is too large for the model context. \
+                     Start a new chat or remove older messages."
+                        .to_string(),
+                );
+            }
+        }
+
         ChatChunk {
             thinking: message.thinking.filter(|s| !s.is_empty()),
             content: message.content.filter(|s| !s.is_empty()),
             tool_calls: message.tool_calls,
             done: self.done,
-            error: self.error,
+            cancelled: None,
+            error,
         }
     }
 }

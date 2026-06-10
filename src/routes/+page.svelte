@@ -1,10 +1,90 @@
 <script lang="ts">
-  import AttachmentStrip from "$lib/components/AttachmentStrip.svelte";
-  import ChatBubble from "$lib/components/ChatBubble.svelte";
+  import { tick } from "svelte";
   import {
+    ensureAgentRoots,
+    loadAgentSettings,
+    saveAgentSettings,
+    type AgentSettings,
+  } from "$lib/agent-settings";
+  import { rememberApproval } from "$lib/agent-approvals";
+  import {
+    approvePlanExecution,
+    buildSingleStepExecutionPrompt,
+    buildSingleStepUserMessage,
+    buildPlanningSystemPrompt,
+    buildPlanningUserMessage,
+    isPlanExecutionApproved,
+    allPlanStepsDone,
+    autoPlanNotice,
+    isPlanCompleteMarker,
+    parsePlanFromContent,
+    planContinueNudge,
+    planReadySummary,
+    planWriteSteps,
+    shouldAutoPlan,
+    type AgentPlan,
+    type PlanStepStatus,
+  } from "$lib/agent-plan";
+  import {
+    buildAgentSystemPrompt,
+    executeAgentTool,
+    isAgentTool,
+    isPermissionDeniedResult,
+    needsApproval,
+    recordSessionApproval,
+    toolsForLevel,
+    toolsForPlanning,
+    VISION_AGENT_SUPPLEMENT,
+  } from "$lib/agent-tools";
+  import { suggestModels } from "$lib/model-capabilities";
+  import ToastStack from "$lib/components/ToastStack.svelte";
+  import { detectKokoro, speakText, stopSpeech, subscribeSpeaking } from "$lib/tts";
+  import {
+    loadTtsSettings,
+    saveTtsSettings,
+    type TtsSettings,
+  } from "$lib/tts-settings";
+  import { pushToast } from "$lib/toast";
+  import { open } from "@tauri-apps/plugin-dialog";
+  import AppSidebar from "$lib/components/AppSidebar.svelte";
+  import ChatBubble from "$lib/components/ChatBubble.svelte";
+  import TaggedView from "$lib/components/TaggedView.svelte";
+  import ChatComposer from "$lib/components/ChatComposer.svelte";
+  import ModelsView from "$lib/components/ModelsView.svelte";
+  import SettingsView from "$lib/components/SettingsView.svelte";
+  import PlanApprovalModal from "$lib/components/PlanApprovalModal.svelte";
+  import PlanPanel from "$lib/components/PlanPanel.svelte";
+  import ToolApprovalModal from "$lib/components/ToolApprovalModal.svelte";
+  import WorkspacePromptModal from "$lib/components/WorkspacePromptModal.svelte";
+  import { truncateHistoryToMessages } from "$lib/branch-conversation";
+  import { copyToClipboard } from "$lib/utils/clipboard";
+  import {
+    buildChatMarkdown,
+    downloadMarkdown,
+    markdownFilename,
+  } from "$lib/utils/download";
+  import {
+    isMessageTagged,
+    loadTaggedMessages,
+    messagePreview,
+    removeTaggedMessage,
+    saveTaggedMessages,
+    toggleTaggedMessage,
+    type TaggedMessage,
+  } from "$lib/tagged-messages";
+  import {
+    applyModePrefix,
+    deriveTitle,
+    loadConversations,
+    saveConversations,
+    type AppView,
+    type ChatMode,
+    type SavedConversation,
+  } from "$lib/conversations";
+  import {
+    cancelChat,
     checkOllama,
     formatAudioNote,
-    formatBytes,
     hasCapability,
     listModels,
     prepareAudioForOllama,
@@ -19,24 +99,62 @@
     PendingAttachment,
     ToolCallDisplay,
   } from "$lib/types";
+  import { levelLabel } from "$lib/agent-settings";
+  import {
+    loadAppPreferences,
+    loadLastModel,
+    pickAvailableModel,
+    saveAppPreferences,
+    saveLastModel,
+  } from "$lib/preferences";
   import { wavBase64ToUrl } from "$lib/utils/audio";
-  import { parseToolCalls } from "$lib/utils/tools";
+  import { parseToolCalls, toolCallsForOllamaHistory } from "$lib/utils/tools";
 
   const DEFAULT_AUDIO_PROMPT = "Transcribe this audio";
+  const MAX_TOOL_ROUNDS = 5;
+  const PLAN_MAX_ROUNDS = 6;
+  const STEP_MAX_ROUNDS = 8;
+  const activeSessions = new Map<string, string>();
+  const abortedConversations = new Set<string>();
 
   let models = $state<ModelInfo[]>([]);
-  let selectedModel = $state("");
+  let selectedModel = $state(loadLastModel());
   let connected = $state(false);
   let statusMessage = $state("Checking Ollama…");
   let thinkEnabled = $state(true);
+  let chatMode = $state<ChatMode>("ask");
   let input = $state("");
   let pending = $state<PendingAttachment[]>([]);
   let messages = $state<DisplayMessage[]>([]);
   let history = $state<ChatMessage[]>([]);
-  let isStreaming = $state(false);
+  let streamingIds = $state<Set<string>>(new Set());
+  let appPreferences = $state(loadAppPreferences());
   let isPreparingAudio = $state(false);
   let errorMessage = $state("");
   let messagesEnd = $state<HTMLDivElement | null>(null);
+
+  let conversations = $state<SavedConversation[]>(loadConversations());
+  let activeConversationId = $state<string | null>(null);
+  let currentView = $state<AppView>("chat");
+  let chatsExpanded = $state(true);
+  let agentSettings = $state<AgentSettings>(loadAgentSettings());
+  let agentPlan = $state<AgentPlan | null>(null);
+  let pendingApproval = $state<{
+    tool: ToolCallDisplay;
+    resolve: (ok: boolean) => void;
+  } | null>(null);
+  let pendingPlanApproval = $state<{
+    plan: AgentPlan;
+    resolve: (ok: boolean) => void;
+  } | null>(null);
+  let showWorkspacePrompt = $state(false);
+  let ttsSettings = $state<TtsSettings>(loadTtsSettings());
+  let kokoroDetected = $state(false);
+  let kokoroPath = $state("");
+  let ttsBusy = $state(false);
+  let speakingTtsTarget = $state<string | null>(null);
+  let taggedMessages = $state(loadTaggedMessages());
+  let scrollToMessageId = $state<string | null>(null);
 
   const selectedModelInfo = $derived(
     models.find((m) => m.name === selectedModel),
@@ -50,6 +168,204 @@
   const hasPendingAudio = $derived(
     pending.some((a) => a.kind === "audio"),
   );
+  const chatTitle = $derived.by(() => {
+    if (messages.length > 0) return deriveTitle(messages);
+    const conv = conversations.find((c) => c.id === activeConversationId);
+    return conv?.title ?? "New chat";
+  });
+
+  function exportChatMarkdown() {
+    const exportable = messages.filter((m) => m.content.trim() && !m.streaming);
+    if (exportable.length === 0) return;
+    void downloadMarkdown(
+      markdownFilename(chatTitle),
+      buildChatMarkdown(
+        exportable.map((m) => ({ role: m.role, content: m.content })),
+      ),
+    );
+  }
+  const isActiveStreaming = $derived(
+    activeConversationId !== null && streamingIds.has(activeConversationId),
+  );
+  const streamingIdList = $derived([...streamingIds]);
+  const toolModelSuggestions = $derived(suggestModels(models, "tools"));
+  const thinkingModelSuggestions = $derived(suggestModels(models, "thinking"));
+  function notifyToolsUnavailable(action: string) {
+    const hint = toolModelSuggestions[0];
+    pushToast(
+      hint
+        ? `Can't ${action} — ${selectedModel || "this model"} has no tools support. Try ${hint} in Settings → Models.`
+        : `Can't ${action} — pick a tools-capable model in Settings → Models.`,
+      "warning",
+    );
+  }
+
+  function updateTtsSettings(next: TtsSettings) {
+    ttsSettings = next;
+    saveTtsSettings(next);
+    void refreshKokoroDetect();
+  }
+
+  async function refreshKokoroDetect() {
+    try {
+      const result = await detectKokoro(ttsSettings.kokoroPath);
+      kokoroDetected = result.found;
+      kokoroPath = result.path ?? "";
+    } catch {
+      kokoroDetected = false;
+      kokoroPath = "";
+    }
+  }
+
+  function isTtsCancelled(error: unknown): boolean {
+    return String(error).toLowerCase().includes("cancel");
+  }
+
+  function stopTts() {
+    stopSpeech();
+    speakingTtsTarget = null;
+  }
+
+  async function testTtsVoice() {
+    if (!kokoroDetected) {
+      pushToast("Kokoro not found. Set the path in Settings → Speech.", "warning");
+      return;
+    }
+    try {
+      await speakText(
+        "Kokoro text to speech is working in Local LLM UI.",
+        ttsSettings,
+      );
+    } catch (error) {
+      if (!isTtsCancelled(error)) pushToast(String(error), "error");
+    }
+  }
+
+  async function maybeAutoSpeak(text: string) {
+    if (!ttsSettings.enabled || !ttsSettings.autoSpeak || !kokoroDetected) return;
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    try {
+      await speakText(trimmed, ttsSettings);
+    } catch (error) {
+      if (!isTtsCancelled(error)) pushToast(String(error), "error");
+    }
+  }
+
+  function speakingBlockKeyFor(messageId: string): string | null {
+    const prefix = `${messageId}:`;
+    if (!speakingTtsTarget?.startsWith(prefix)) return null;
+    return speakingTtsTarget.slice(prefix.length);
+  }
+
+  async function speakMessage(messageId: string, text: string) {
+    if (!ttsSettings.enabled) {
+      pushToast("Enable read-aloud in Settings → Speech.", "warning");
+      return;
+    }
+    if (!kokoroDetected) {
+      pushToast("Kokoro not found. Configure it in Settings → Speech.", "warning");
+      return;
+    }
+    speakingTtsTarget = messageId;
+    try {
+      await speakText(text, ttsSettings);
+    } catch (error) {
+      if (!isTtsCancelled(error)) pushToast(String(error), "error");
+    } finally {
+      if (!ttsBusy) speakingTtsTarget = null;
+    }
+  }
+
+  function branchFromMessage(index: number) {
+    if (!activeConversationId || index < 0 || index >= messages.length) return;
+    syncActiveConversation(true);
+
+    const branchMessages = messages.slice(0, index + 1).map((m) => ({
+      ...m,
+      streaming: false,
+    }));
+    const branchHistory = truncateHistoryToMessages(history, branchMessages);
+    const newId = crypto.randomUUID();
+    const baseTitle = deriveTitle(branchMessages);
+
+    const newConv: SavedConversation = {
+      id: newId,
+      title: baseTitle === "New chat" ? "Branch" : `${baseTitle} (branch)`,
+      model: selectedModel,
+      thinkEnabled,
+      chatMode,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      messages: branchMessages,
+      history: branchHistory,
+      agentPlan: null,
+    };
+
+    conversations = [newConv, ...conversations];
+    saveConversations(conversations);
+    selectConversation(newId);
+    pushToast("Branched chat from this message");
+  }
+
+  function toggleMessageTag(message: DisplayMessage) {
+    if (!activeConversationId) return;
+    taggedMessages = toggleTaggedMessage(taggedMessages, {
+      conversationId: activeConversationId,
+      messageId: message.id,
+      conversationTitle: chatTitle,
+      role: message.role,
+      preview: messagePreview(message.content),
+      content: message.content,
+    });
+    saveTaggedMessages(taggedMessages);
+    const tagged = isMessageTagged(
+      taggedMessages,
+      activeConversationId,
+      message.id,
+    );
+    pushToast(tagged ? "Message tagged" : "Tag removed");
+  }
+
+  function openTaggedMessage(tag: TaggedMessage) {
+    const conv = conversations.find((c) => c.id === tag.conversationId);
+    if (!conv) {
+      taggedMessages = removeTaggedMessage(taggedMessages, tag.id);
+      saveTaggedMessages(taggedMessages);
+      pushToast("Original chat no longer exists — tag removed", "warning");
+      return;
+    }
+    scrollToMessageId = tag.messageId;
+    selectConversation(tag.conversationId);
+  }
+
+  function removeTaggedMessageById(id: string) {
+    taggedMessages = removeTaggedMessage(taggedMessages, id);
+    saveTaggedMessages(taggedMessages);
+  }
+
+  async function speakMessageBlock(
+    messageId: string,
+    blockKey: string,
+    blockText: string,
+  ) {
+    if (!ttsSettings.enabled) {
+      pushToast("Enable read-aloud in Settings → Speech.", "warning");
+      return;
+    }
+    if (!kokoroDetected) {
+      pushToast("Kokoro not found. Configure it in Settings → Speech.", "warning");
+      return;
+    }
+    speakingTtsTarget = `${messageId}:${blockKey}`;
+    try {
+      await speakText(blockText, ttsSettings, { raw: true });
+    } catch (error) {
+      if (!isTtsCancelled(error)) pushToast(String(error), "error");
+    } finally {
+      if (!ttsBusy) speakingTtsTarget = null;
+    }
+  }
 
   async function refreshModels() {
     try {
@@ -57,8 +373,13 @@
       connected = true;
       statusMessage = "Connected to Ollama";
       models = await listModels();
-      if (!selectedModel && models.length > 0) {
-        selectedModel = models[0].name;
+      if (models.length > 0) {
+        const next = pickAvailableModel(
+          models,
+          selectedModel,
+          loadLastModel(),
+        );
+        setSelectedModel(next);
       }
       errorMessage = "";
     } catch (error) {
@@ -69,15 +390,292 @@
     }
   }
 
+  function syncActiveConversation(finalize = false) {
+    if (!activeConversationId) return;
+
+    const existing = conversations.find((c) => c.id === activeConversationId);
+    const nextMessages = finalize
+      ? messages.map((m) => ({ ...m, streaming: false }))
+      : [...messages];
+
+    const conv: SavedConversation = {
+      id: activeConversationId,
+      title: messages.length > 0 ? deriveTitle(messages) : (existing?.title ?? "New chat"),
+      model: selectedModel,
+      thinkEnabled,
+      chatMode,
+      createdAt: existing?.createdAt ?? Date.now(),
+      updatedAt: Date.now(),
+      messages: nextMessages,
+      history: [...history],
+      agentPlan,
+    };
+
+    if (existing) {
+      conversations = conversations.map((c) =>
+        c.id === activeConversationId ? conv : c,
+      );
+    } else if (messages.length > 0) {
+      conversations = [conv, ...conversations];
+    }
+    saveConversations(conversations);
+    updateAppPreferences({ lastActiveConversationId: activeConversationId });
+  }
+
+  function persistCurrentChat() {
+    if (!activeConversationId || messages.length === 0) return;
+    syncActiveConversation(true);
+  }
+
+  function getConversationMessages(convId: string): DisplayMessage[] {
+    if (convId === activeConversationId) return messages;
+    return conversations.find((c) => c.id === convId)?.messages ?? [];
+  }
+
+  function setConversationMessages(convId: string, next: DisplayMessage[]) {
+    if (convId === activeConversationId) messages = next;
+    conversations = conversations.map((c) =>
+      c.id === convId ? { ...c, messages: next, updatedAt: Date.now() } : c,
+    );
+  }
+
+  function setConversationHistory(convId: string, next: ChatMessage[]) {
+    if (convId === activeConversationId) history = next;
+    conversations = conversations.map((c) =>
+      c.id === convId ? { ...c, history: next } : c,
+    );
+  }
+
+  function setConversationPlan(convId: string, plan: AgentPlan | null) {
+    if (convId === activeConversationId) agentPlan = plan;
+    conversations = conversations.map((c) =>
+      c.id === convId ? { ...c, agentPlan: plan, updatedAt: Date.now() } : c,
+    );
+    saveConversations(conversations);
+  }
+
+  function patchPlanStep(
+    convId: string,
+    stepIndex: number,
+    status: PlanStepStatus,
+  ) {
+    const plan = convId === activeConversationId
+      ? agentPlan
+      : conversations.find((c) => c.id === convId)?.agentPlan;
+    if (!plan || stepIndex < 0 || stepIndex >= plan.steps.length) return;
+
+    const steps = plan.steps.map((s, i) =>
+      i === stepIndex ? { ...s, status } : s,
+    );
+    setConversationPlan(convId, { ...plan, steps });
+  }
+
+  function appendConvMessage(convId: string, msg: DisplayMessage) {
+    setConversationMessages(convId, [...getConversationMessages(convId), msg]);
+  }
+
+  function contextToolCallsForMessage(index: number): ToolCallDisplay[] {
+    let lastUserIdx = -1;
+    for (let i = index; i >= 0; i--) {
+      if (messages[i].role === "user") {
+        lastUserIdx = i;
+        break;
+      }
+    }
+
+    const tools: ToolCallDisplay[] = [];
+    for (let i = lastUserIdx + 1; i <= index; i++) {
+      const roundTools = messages[i].toolCalls;
+      if (roundTools?.length) {
+        tools.push(...roundTools);
+      }
+    }
+    return tools;
+  }
+
+  function patchConvMessage(
+    convId: string,
+    id: string,
+    patch: Partial<DisplayMessage>,
+  ) {
+    setConversationMessages(
+      convId,
+      getConversationMessages(convId).map((m) =>
+        m.id === id ? { ...m, ...patch } : m,
+      ),
+    );
+  }
+
+  async function stopStreaming() {
+    const convId = activeConversationId;
+    if (!convId) return;
+
+    abortedConversations.add(convId);
+    const sessionId = activeSessions.get(convId);
+
+    if (sessionId) {
+      try {
+        await cancelChat(sessionId);
+      } catch {
+        // Stream may have just finished.
+      }
+    }
+
+    activeSessions.delete(convId);
+    removeStreaming(convId);
+
+    setConversationMessages(
+      convId,
+      getConversationMessages(convId).map((m) =>
+        m.streaming ? { ...m, streaming: false } : m,
+      ),
+    );
+  }
+
+  function toggleSidebarCollapsed() {
+    updateAppPreferences({
+      sidebarCollapsed: !appPreferences.sidebarCollapsed,
+    });
+  }
+
+  function addStreaming(convId: string) {
+    streamingIds = new Set([...streamingIds, convId]);
+  }
+
+  function removeStreaming(convId: string) {
+    streamingIds = new Set([...streamingIds].filter((id) => id !== convId));
+  }
+
+  function startNewChat() {
+    if (activeConversationId && messages.length > 0) {
+      syncActiveConversation(true);
+    }
+    const newId = crypto.randomUUID();
+    activeConversationId = newId;
+    messages = [];
+    history = [];
+    agentPlan = null;
+    input = "";
+    pending = [];
+    errorMessage = "";
+    chatMode = "ask";
+    currentView = "chat";
+    updateAppPreferences({ lastActiveConversationId: newId });
+  }
+
+  function selectConversation(id: string) {
+    if (activeConversationId && activeConversationId !== id) {
+      syncActiveConversation(true);
+    }
+    const conv = conversations.find((c) => c.id === id);
+    if (!conv) return;
+    activeConversationId = id;
+    messages = conv.messages;
+    history = conv.history;
+    agentPlan = conv.agentPlan ?? null;
+    setSelectedModel(conv.model);
+    thinkEnabled = conv.thinkEnabled;
+    chatMode = conv.chatMode;
+    input = "";
+    pending = [];
+    errorMessage = "";
+    currentView = "chat";
+    updateAppPreferences({ lastActiveConversationId: id });
+  }
+
+  function deleteConversation(id: string) {
+    conversations = conversations.filter((c) => c.id !== id);
+    saveConversations(conversations);
+    if (activeConversationId === id) {
+      startNewChat();
+    }
+  }
+
+  function navigate(view: AppView) {
+    currentView = view;
+  }
+
+  function setSelectedModel(name: string) {
+    selectedModel = name;
+    saveLastModel(name);
+  }
+
+  function updateAppPreferences(partial: Partial<typeof appPreferences>) {
+    appPreferences = { ...appPreferences, ...partial };
+    saveAppPreferences(appPreferences);
+  }
+
+  let conversationsHydrated = false;
+
   $effect(() => {
     refreshModels();
   });
 
   $effect(() => {
-    if (messages.length > 0) {
-      messagesEnd?.scrollIntoView({ behavior: "smooth" });
+    if (conversationsHydrated) return;
+    conversationsHydrated = true;
+
+    if (conversations.length === 0) {
+      activeConversationId = crypto.randomUUID();
+      return;
     }
+
+    const sorted = [...conversations].sort((a, b) => b.updatedAt - a.updatedAt);
+    const preferredId = appPreferences.lastActiveConversationId;
+    const target =
+      (preferredId
+        ? conversations.find((c) => c.id === preferredId)
+        : undefined) ?? sorted[0];
+
+    activeConversationId = target.id;
+    messages = target.messages;
+    history = target.history;
+    agentPlan = target.agentPlan ?? null;
+    setSelectedModel(target.model);
+    thinkEnabled = target.thinkEnabled;
+    chatMode = target.chatMode;
   });
+
+  $effect(() => {
+    if (!agentSettings.enabled || agentSettings.allowedRoots.length > 0) return;
+    ensureAgentRoots(agentSettings).then((next) => {
+      agentSettings = next;
+      saveAgentSettings(next);
+    });
+  });
+
+  $effect(() => {
+    if (currentView !== "chat" || messages.length === 0) return;
+    const targetId = scrollToMessageId;
+    if (targetId) {
+      void tick().then(() => {
+        document
+          .getElementById(`msg-${targetId}`)
+          ?.scrollIntoView({ behavior: "smooth", block: "center" });
+        scrollToMessageId = null;
+      });
+      return;
+    }
+    messagesEnd?.scrollIntoView({ behavior: "smooth" });
+  });
+
+  $effect(() => {
+    void refreshKokoroDetect();
+  });
+
+  $effect(() => {
+    return subscribeSpeaking((active) => {
+      ttsBusy = active;
+      if (!active) speakingTtsTarget = null;
+    });
+  });
+
+  function onGlobalKeydown(event: KeyboardEvent) {
+    if ((event.ctrlKey || event.metaKey) && event.key === "n") {
+      event.preventDefault();
+      startNewChat();
+    }
+  }
 
   function readFileAsBase64(file: File): Promise<string> {
     return new Promise((resolve, reject) => {
@@ -96,11 +694,7 @@
     });
   }
 
-  async function onImageSelected(event: Event) {
-    const target = event.target as HTMLInputElement;
-    const files = target.files;
-    if (!files?.length) return;
-
+  async function handleImageFiles(files: FileList) {
     for (const file of Array.from(files)) {
       const base64 = await readFileAsBase64(file);
       pending = [
@@ -113,17 +707,11 @@
         },
       ];
     }
-    target.value = "";
   }
 
-  async function onAudioSelected(event: Event) {
-    const target = event.target as HTMLInputElement;
-    const files = target.files;
-    if (!files?.length) return;
-
+  async function handleAudioFiles(files: FileList) {
     isPreparingAudio = true;
     errorMessage = "";
-
     try {
       for (const file of Array.from(files)) {
         const result = await prepareAudioForOllama(file);
@@ -143,12 +731,7 @@
       errorMessage = String(error);
     } finally {
       isPreparingAudio = false;
-      target.value = "";
     }
-  }
-
-  function removePending(index: number) {
-    pending = pending.filter((_, i) => i !== index);
   }
 
   function attachmentsForOllama(items: PendingAttachment[]): string[] {
@@ -169,30 +752,810 @@
     }));
   }
 
-  async function sendMessage() {
-    const trimmed = input.trim();
-    if (
-      (!trimmed && pending.length === 0) ||
-      !selectedModel ||
-      isStreaming ||
-      isPreparingAudio
-    ) {
-      return;
+  function updateAgentSettings(next: AgentSettings) {
+    agentSettings = next;
+    saveAgentSettings(next);
+  }
+
+  async function pickWorkspaceFolder(): Promise<boolean> {
+    try {
+      const selected = await open({
+        directory: true,
+        multiple: false,
+        title: "Choose workspace folder for agent tools",
+      });
+      if (typeof selected !== "string" || !selected.trim()) return false;
+      updateAgentSettings({
+        ...agentSettings,
+        allowedRoots: [
+          ...new Set([...agentSettings.allowedRoots, selected.trim()]),
+        ],
+      });
+      showWorkspacePrompt = false;
+      errorMessage = "";
+      return true;
+    } catch (error) {
+      errorMessage = String(error);
+      return false;
+    }
+  }
+
+  async function ensureWorkspaceRoots(): Promise<boolean> {
+    if (agentSettings.allowedRoots.length > 0) return true;
+    showWorkspacePrompt = true;
+    return false;
+  }
+
+  async function addAgentRoot() {
+    await pickWorkspaceFolder();
+  }
+
+  function removeAgentRoot(index: number) {
+    updateAgentSettings({
+      ...agentSettings,
+      allowedRoots: agentSettings.allowedRoots.filter((_, i) => i !== index),
+    });
+  }
+
+  function requestApproval(tool: ToolCallDisplay): Promise<boolean> {
+    return new Promise((resolve) => {
+      pendingApproval = { tool, resolve };
+    });
+  }
+
+  function handleApproval(approved: boolean, remember = false) {
+    if (!pendingApproval) return;
+    const { tool, resolve } = pendingApproval;
+    if (approved) {
+      if (remember) rememberApproval(tool);
+      else if (agentSettings.approvalPolicy === "session") {
+        recordSessionApproval(tool);
+      }
+    }
+    resolve(approved);
+    pendingApproval = null;
+  }
+
+  function upsertSystemPrompt(
+    chatHistory: ChatMessage[],
+    prompt: string,
+  ): ChatMessage[] {
+    const idx = chatHistory.findIndex((m) => m.role === "system");
+    if (idx >= 0) {
+      return chatHistory.map((m, i) =>
+        i === idx ? { ...m, content: prompt } : m,
+      );
+    }
+    return [{ role: "system", content: prompt }, ...chatHistory];
+  }
+
+  function upsertAgentSystemPrompt(
+    chatHistory: ChatMessage[],
+    options?: { visionInput?: boolean },
+  ): ChatMessage[] {
+    if (!agentSettings.enabled) {
+      if (options?.visionInput && supportsVision) {
+        return upsertSystemPrompt(chatHistory, VISION_AGENT_SUPPLEMENT);
+      }
+      return chatHistory;
+    }
+    let prompt = buildAgentSystemPrompt(agentSettings);
+    if (options?.visionInput && supportsVision) {
+      prompt = `${prompt}\n\n${VISION_AGENT_SUPPLEMENT}`;
+    }
+    return upsertSystemPrompt(chatHistory, prompt);
+  }
+
+  function upsertPlanningSystemPrompt(
+    chatHistory: ChatMessage[],
+  ): ChatMessage[] {
+    return upsertSystemPrompt(
+      chatHistory,
+      buildPlanningSystemPrompt(agentSettings),
+    );
+  }
+
+  function permissionDeniedMessage(): string {
+    const level = levelLabel(agentSettings.level);
+    if (agentSettings.level === "read") {
+      return (
+        `I can't create or modify files because agent access is **${level}**. ` +
+        "Enable **Read & write** or **Full access** in Settings → Agent, then try again."
+      );
+    }
+    return (
+      `That operation isn't allowed at the current permission level (**${level}**). ` +
+      "Check Settings → Agent to raise access if needed."
+    );
+  }
+
+  function requestPlanApproval(plan: AgentPlan): Promise<boolean> {
+    return new Promise((resolve) => {
+      pendingPlanApproval = { plan, resolve };
+    });
+  }
+
+  function handlePlanApproval(approved: boolean) {
+    if (!pendingPlanApproval) return;
+    const { plan, resolve } = pendingPlanApproval;
+    if (approved && activeConversationId) {
+      approvePlanExecution(activeConversationId, plan.id);
+    }
+    resolve(approved);
+    pendingPlanApproval = null;
+  }
+
+  async function runToolBatch(
+    toolCalls: ToolCallDisplay[],
+    options?: { planApproved?: boolean },
+  ): Promise<ToolCallDisplay[]> {
+    const executed: ToolCallDisplay[] = [];
+    for (const tool of toolCalls) {
+      const tagged: ToolCallDisplay = { ...tool, source: "agent" };
+      if (!isAgentTool(tool.name)) {
+        executed.push({
+          ...tagged,
+          status: "failed",
+          result: `Tool "${tool.name}" is not a built-in agent tool.`,
+        });
+        continue;
+      }
+      if (
+        !options?.planApproved &&
+        needsApproval(tagged, agentSettings.approvalPolicy)
+      ) {
+        const ok = await requestApproval(tagged);
+        if (!ok) {
+          executed.push({
+            ...tagged,
+            status: "failed",
+            result: "Operation denied by user.",
+          });
+          continue;
+        }
+      }
+      try {
+        const result = await executeAgentTool(tagged, agentSettings);
+        const denied = isPermissionDeniedResult(result);
+        executed.push({
+          ...tagged,
+          status: denied ? "failed" : "completed",
+          result,
+        });
+      } catch (error) {
+        executed.push({
+          ...tagged,
+          status: "failed",
+          result: String(error),
+        });
+      }
+    }
+    return executed;
+  }
+
+  async function streamAssistantRound(
+    convId: string,
+    chatHistory: ChatMessage[],
+    assistantId: string,
+    sessionId: string,
+    useAudioContext: boolean,
+    streamModel: string,
+    streamThink: boolean | undefined,
+    streamTools: boolean,
+    toolsOverride?: unknown[],
+  ): Promise<{
+    thinking: string;
+    content: string;
+    toolCalls: ToolCallDisplay[];
+    cancelled: boolean;
+  }> {
+    let thinking = "";
+    let content = "";
+    let toolCalls: ToolCallDisplay[] = [];
+    let cancelled = false;
+    let thinkingStartedAt: number | null = null;
+
+    const tools =
+      toolsOverride ??
+      (streamTools && agentSettings.enabled
+        ? toolsForLevel(agentSettings)
+        : undefined);
+
+    activeSessions.set(convId, sessionId);
+
+    const streamResult = await streamChat(
+      sessionId,
+      {
+        model: streamModel,
+        messages: chatHistory,
+        think: streamThink,
+        tools,
+        stream: true,
+        options: {
+          num_predict: -1,
+          num_ctx: 8192,
+        },
+      },
+      (chunk) => {
+        if (chunk.cancelled) cancelled = true;
+        if (convId === activeConversationId && chunk.error) {
+          errorMessage = chunk.error;
+        }
+        if (chunk.thinking) {
+          if (thinkingStartedAt === null) thinkingStartedAt = Date.now();
+          thinking += chunk.thinking;
+        }
+        if (chunk.content) content += chunk.content;
+        if (chunk.tool_calls?.length) {
+          toolCalls = parseToolCalls(chunk.tool_calls).map((t) => ({
+            ...t,
+            status: "running" as const,
+            source: "agent" as const,
+          }));
+        }
+
+        patchConvMessage(convId, assistantId, {
+          thinking,
+          content,
+          toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
+          streaming: !chunk.done,
+        });
+      },
+    );
+
+    cancelled = cancelled || streamResult.cancelled || abortedConversations.has(convId);
+    if (thinkingStartedAt) {
+      patchConvMessage(convId, assistantId, {
+        thinkingDurationMs: Date.now() - thinkingStartedAt,
+      });
+    }
+    activeSessions.delete(convId);
+    return { thinking, content, toolCalls, cancelled };
+  }
+
+  async function runAgentLoop(opts: {
+    convId: string;
+    chatHistory: ChatMessage[];
+    initialAssistantId: string;
+    streamModel: string;
+    streamThink: boolean | undefined;
+    streamTools: boolean;
+    toolsOverride?: unknown[];
+    maxRounds: number;
+    planApproved?: boolean;
+    includesAudio?: boolean;
+    /** Keep going when the model replies without tools (plan execution). */
+    persistWithoutTools?: boolean;
+  }): Promise<{
+    chatHistory: ChatMessage[];
+    finished: boolean;
+    lastRoundToolFailed: boolean;
+  }> {
+    const {
+      convId,
+      initialAssistantId,
+      streamModel,
+      streamThink,
+      streamTools,
+      toolsOverride,
+      maxRounds,
+      planApproved,
+      includesAudio = false,
+      persistWithoutTools = false,
+    } = opts;
+    let chatHistory = opts.chatHistory;
+    let currentAssistantId = initialAssistantId;
+    let finished = false;
+    let lastRoundToolFailed = false;
+
+    for (let round = 0; round < maxRounds; round++) {
+      if (abortedConversations.has(convId)) break;
+
+      const sessionId = crypto.randomUUID();
+      const { thinking, content, toolCalls, cancelled } =
+        await streamAssistantRound(
+          convId,
+          chatHistory,
+          currentAssistantId,
+          sessionId,
+          includesAudio && round === 0,
+          streamModel,
+          streamThink,
+          streamTools,
+          toolsOverride,
+        );
+
+      if (cancelled || abortedConversations.has(convId)) {
+        patchConvMessage(convId, currentAssistantId, {
+          thinking,
+          content,
+          streaming: false,
+        });
+        break;
+      }
+
+      if (toolCalls.length === 0) {
+        patchConvMessage(convId, currentAssistantId, {
+          thinking,
+          content,
+          streaming: false,
+        });
+        chatHistory = [
+          ...chatHistory,
+          {
+            role: "assistant",
+            content,
+            thinking: thinking || undefined,
+          },
+        ];
+
+        if (persistWithoutTools && isPlanCompleteMarker(content)) {
+          finished = true;
+          break;
+        }
+
+        if (persistWithoutTools && round < maxRounds - 1) {
+          chatHistory.push({
+            role: "system",
+            content: planContinueNudge(),
+          });
+          currentAssistantId = crypto.randomUUID();
+          appendConvMessage(convId, {
+            id: currentAssistantId,
+            role: "assistant",
+            content: "",
+            thinking: "",
+            streaming: true,
+          });
+          continue;
+        }
+
+        finished = !persistWithoutTools;
+        break;
+      }
+
+      if (abortedConversations.has(convId)) break;
+
+      if (persistWithoutTools) {
+        patchPlanStep(convId, round, "running");
+      }
+      const executed = await runToolBatch(toolCalls, { planApproved });
+      if (abortedConversations.has(convId)) break;
+
+      const denied = executed.some((t) => isPermissionDeniedResult(t.result));
+      const toolFailed = executed.some((t) => t.status === "failed");
+      lastRoundToolFailed = denied || toolFailed;
+      if (persistWithoutTools) {
+        patchPlanStep(
+          convId,
+          round,
+          lastRoundToolFailed ? "failed" : "done",
+        );
+      }
+      patchConvMessage(convId, currentAssistantId, {
+        thinking,
+        content: content || "",
+        toolCalls: executed,
+        streaming: false,
+      });
+
+      chatHistory = [
+        ...chatHistory,
+        {
+          role: "assistant",
+          content: "",
+          tool_calls: toolCallsForOllamaHistory(toolCalls),
+        },
+      ];
+
+      for (const tool of executed) {
+        chatHistory.push({
+          role: "tool",
+          content: tool.result ?? "Error",
+          tool_name: tool.name,
+        });
+      }
+
+      if (denied) {
+        currentAssistantId = crypto.randomUUID();
+        appendConvMessage(convId, {
+          id: currentAssistantId,
+          role: "assistant",
+          content: "",
+          thinking: "",
+          streaming: true,
+        });
+        chatHistory.push({
+          role: "system",
+          content:
+            "A tool was denied due to permission level. Respond to the user explaining what access level is required. Do not call any more tools.",
+        });
+        const finalSessionId = crypto.randomUUID();
+        const final = await streamAssistantRound(
+          convId,
+          chatHistory,
+          currentAssistantId,
+          finalSessionId,
+          false,
+          streamModel,
+          streamThink,
+          false,
+        );
+        patchConvMessage(convId, currentAssistantId, {
+          thinking: final.thinking,
+          content: final.content.trim() || permissionDeniedMessage(),
+          streaming: false,
+        });
+        chatHistory = [
+          ...chatHistory,
+          {
+            role: "assistant",
+            content: final.content.trim() || permissionDeniedMessage(),
+            thinking: final.thinking || undefined,
+          },
+        ];
+        finished = true;
+        break;
+      }
+
+      currentAssistantId = crypto.randomUUID();
+      appendConvMessage(convId, {
+        id: currentAssistantId,
+        role: "assistant",
+        content: "",
+        thinking: "",
+        toolCalls: [],
+        streaming: true,
+      });
     }
 
-    const includesAudio = hasPendingAudio;
-    const messageContent =
-      trimmed || (includesAudio ? DEFAULT_AUDIO_PROMPT : "");
+    return { chatHistory, finished, lastRoundToolFailed };
+  }
 
-    const sentAttachments = attachmentsForDisplay(pending);
+  function getActivePlan(convId: string): AgentPlan | null {
+    if (convId === activeConversationId) return agentPlan;
+    return conversations.find((c) => c.id === convId)?.agentPlan ?? null;
+  }
+
+  async function generatePlan(
+    convId: string,
+    rawContent: string,
+    attachments: PendingAttachment[],
+    autoTriggered = false,
+  ) {
+    if (!(await ensureWorkspaceRoots())) return;
 
     messages = [
       ...messages,
       {
         id: crypto.randomUUID(),
         role: "user",
-        content: messageContent,
-        attachments: sentAttachments,
+        content: rawContent,
+        attachments: attachmentsForDisplay(attachments),
+      },
+    ];
+
+    history = [
+      ...history,
+      {
+        role: "user",
+        content: buildPlanningUserMessage(
+          rawContent,
+          agentSettings.allowedRoots,
+        ),
+        images:
+          attachments.length > 0 ? attachmentsForOllama(attachments) : undefined,
+      },
+    ];
+
+    const assistantId = crypto.randomUUID();
+    messages = [
+      ...messages,
+      {
+        id: assistantId,
+        role: "assistant",
+        content: "",
+        thinking: "",
+        streaming: true,
+      },
+    ];
+
+    addStreaming(convId);
+    errorMessage = "";
+
+    const streamModel = selectedModel;
+    const streamThink = supportsThinking ? thinkEnabled : undefined;
+
+    let chatHistory = upsertPlanningSystemPrompt([...history]);
+    let parsedPlan: AgentPlan | null = null;
+
+    try {
+      ({ chatHistory } = await runAgentLoop({
+        convId,
+        chatHistory,
+        initialAssistantId: assistantId,
+        streamModel,
+        streamThink,
+        streamTools: true,
+        toolsOverride: toolsForPlanning(agentSettings),
+        maxRounds: PLAN_MAX_ROUNDS,
+      }));
+
+      const lastAssistant = [...getConversationMessages(convId)]
+        .reverse()
+        .find((m) => m.role === "assistant" && !m.streaming);
+      const rawPlanContent = [
+        lastAssistant?.content ?? "",
+        lastAssistant?.thinking ?? "",
+      ].join("\n");
+      parsedPlan = parsePlanFromContent(rawPlanContent, rawContent);
+
+      if (parsedPlan) {
+        setConversationPlan(convId, parsedPlan);
+        const summaryId = lastAssistant?.id ?? assistantId;
+        const summary = autoTriggered
+          ? `${autoPlanNotice()}\n\n${planReadySummary()}`
+          : planReadySummary();
+        patchConvMessage(convId, summaryId, {
+          content: summary,
+          thinking: lastAssistant?.thinking,
+          toolCalls: lastAssistant?.toolCalls,
+        });
+      } else if (lastAssistant) {
+        patchConvMessage(convId, lastAssistant.id, {
+          content:
+            (lastAssistant.content || "").trim() ||
+            "I couldn't build a structured plan. Try rephrasing your request.",
+        });
+      }
+
+      setConversationHistory(convId, chatHistory);
+      syncActiveConversation(true);
+    } catch (error) {
+      if (convId === activeConversationId) errorMessage = String(error);
+      patchConvMessage(convId, assistantId, {
+        content: "Failed to generate a plan.",
+        streaming: false,
+      });
+      syncActiveConversation(true);
+    } finally {
+      activeSessions.delete(convId);
+      abortedConversations.delete(convId);
+      removeStreaming(convId);
+    }
+
+  }
+
+  async function executePlan() {
+    if (!activeConversationId || !agentPlan || isActiveStreaming) return;
+    if (!supportsTools) {
+      notifyToolsUnavailable("run a plan");
+      return;
+    }
+    if (!(await ensureWorkspaceRoots())) return;
+
+    const convId = activeConversationId;
+    let plan = agentPlan;
+
+    if (plan.status === "failed") {
+      plan = {
+        ...plan,
+        status: "ready",
+        steps: plan.steps.map((s) =>
+          s.status === "failed" ? { ...s, status: "pending" as PlanStepStatus } : s,
+        ),
+      };
+      setConversationPlan(convId, plan);
+    }
+
+    if (planWriteSteps(plan).length > 0) {
+      const alreadyApproved = isPlanExecutionApproved(convId, plan.id);
+      if (!alreadyApproved) {
+        const ok = await requestPlanApproval(plan);
+        if (!ok) return;
+      }
+    }
+
+    const executingPlan: AgentPlan = {
+      ...plan,
+      status: "executing",
+      steps: plan.steps.map((s) => ({
+        ...s,
+        status: s.status === "done" ? ("done" as PlanStepStatus) : ("pending" as PlanStepStatus),
+      })),
+    };
+    setConversationPlan(convId, executingPlan);
+
+    addStreaming(convId);
+    errorMessage = "";
+
+    const streamModel = selectedModel;
+    const streamThink = supportsThinking ? thinkEnabled : undefined;
+    let chatHistory = upsertAgentSystemPrompt([...history]);
+
+    let allStepsOk = true;
+
+    try {
+      for (let i = 0; i < executingPlan.steps.length; i++) {
+        if (abortedConversations.has(convId)) {
+          allStepsOk = false;
+          break;
+        }
+
+        const livePlan = getActivePlan(convId) ?? executingPlan;
+        const step = livePlan.steps[i];
+        if (!step || step.status === "done") continue;
+
+        patchPlanStep(convId, i, "running");
+
+        const assistantId = crypto.randomUUID();
+        appendConvMessage(convId, {
+          id: assistantId,
+          role: "assistant",
+          content: "",
+          thinking: "",
+          streaming: true,
+        });
+
+        const stepHistory: ChatMessage[] = [
+          ...chatHistory,
+          {
+            role: "system",
+            content: buildSingleStepExecutionPrompt(
+              agentSettings,
+              livePlan,
+              i,
+            ),
+          },
+          { role: "user", content: buildSingleStepUserMessage(step) },
+        ];
+
+        const { chatHistory: afterStep, lastRoundToolFailed, finished } =
+          await runAgentLoop({
+            convId,
+            chatHistory: stepHistory,
+            initialAssistantId: assistantId,
+            streamModel,
+            streamThink,
+            streamTools: supportsTools,
+            maxRounds: STEP_MAX_ROUNDS,
+            planApproved: true,
+          });
+
+        chatHistory = afterStep;
+
+        const lastBubble = getConversationMessages(convId).find(
+          (m) => m.id === assistantId,
+        );
+        const stepContent = lastBubble?.content ?? "";
+        const stepOk =
+          !lastRoundToolFailed &&
+          !abortedConversations.has(convId) &&
+          (finished || isPlanCompleteMarker(stepContent) || !lastRoundToolFailed);
+
+        patchPlanStep(convId, i, stepOk ? "done" : "failed");
+
+        if (lastBubble && stepContent.trim()) {
+          chatHistory.push({
+            role: "assistant",
+            content: stepContent,
+            thinking: lastBubble.thinking,
+          });
+        }
+
+        if (!stepOk) {
+          allStepsOk = false;
+          break;
+        }
+      }
+
+      const finalPlan = getActivePlan(convId) ?? executingPlan;
+      const completed = allStepsOk && allPlanStepsDone(finalPlan);
+
+      setConversationPlan(convId, {
+        ...finalPlan,
+        status: completed ? "completed" : "failed",
+      });
+      setConversationHistory(convId, chatHistory);
+      syncActiveConversation(true);
+    } catch (error) {
+      if (convId === activeConversationId) errorMessage = String(error);
+      const failedPlan = getActivePlan(convId) ?? executingPlan;
+      setConversationPlan(convId, { ...failedPlan, status: "failed" });
+      syncActiveConversation(true);
+    } finally {
+      activeSessions.delete(convId);
+      abortedConversations.delete(convId);
+      removeStreaming(convId);
+    }
+  }
+
+  function discardPlan() {
+    if (!activeConversationId) return;
+    setConversationPlan(activeConversationId, null);
+  }
+
+  function updatePlan(next: AgentPlan) {
+    if (!activeConversationId) return;
+    setConversationPlan(activeConversationId, next);
+  }
+
+  async function sendMessage() {
+    const trimmed = input.trim();
+    if (
+      (!trimmed && pending.length === 0) ||
+      !selectedModel ||
+      isActiveStreaming ||
+      isPreparingAudio
+    ) {
+      return;
+    }
+
+    if (!activeConversationId) {
+      activeConversationId = crypto.randomUUID();
+    }
+
+    const convId = activeConversationId;
+
+    if (streamingIds.size >= appPreferences.maxConcurrentChats) {
+      errorMessage = `Maximum ${appPreferences.maxConcurrentChats} concurrent chats. Wait for one to finish or raise the limit in Settings.`;
+      return;
+    }
+
+    const includesAudio = hasPendingAudio;
+    const rawContent =
+      trimmed || (includesAudio ? DEFAULT_AUDIO_PROMPT : "");
+    const savedPending = [...pending];
+    const savedMode = chatMode;
+
+    input = "";
+    pending = [];
+    chatMode = "ask";
+
+    const hasVisionInput = savedPending.some((a) => a.kind === "image");
+
+    const autoPlan =
+      savedMode === "ask" &&
+      agentSettings.enabled &&
+      supportsTools &&
+      !hasVisionInput &&
+      shouldAutoPlan(rawContent);
+
+    const willUseAgentTools =
+      agentSettings.enabled && supportsTools && !hasVisionInput;
+
+    if (willUseAgentTools && !(await ensureWorkspaceRoots())) {
+      input = rawContent;
+      pending = savedPending;
+      chatMode = savedMode;
+      return;
+    }
+
+    if (savedMode === "plan" || autoPlan) {
+      if (!agentSettings.enabled || !supportsTools) {
+        notifyToolsUnavailable("use Plan mode");
+        input = rawContent;
+        pending = savedPending;
+        chatMode = savedMode;
+        return;
+      }
+      await generatePlan(convId, rawContent, savedPending, autoPlan);
+      return;
+    }
+
+    if (agentSettings.enabled && !supportsTools && !hasVisionInput) {
+      notifyToolsUnavailable("run agent tools");
+    }
+
+    const messageContent = applyModePrefix(rawContent, savedMode);
+
+    messages = [
+      ...messages,
+      {
+        id: crypto.randomUUID(),
+        role: "user",
+        content: rawContent,
+        attachments: attachmentsForDisplay(savedPending),
       },
     ];
 
@@ -202,12 +1565,11 @@
         role: "user",
         content: messageContent,
         images:
-          pending.length > 0 ? attachmentsForOllama(pending) : undefined,
+          savedPending.length > 0
+            ? attachmentsForOllama(savedPending)
+            : undefined,
       },
     ];
-
-    input = "";
-    pending = [];
 
     const assistantId = crypto.randomUUID();
     messages = [
@@ -222,294 +1584,304 @@
       },
     ];
 
-    isStreaming = true;
+    addStreaming(convId);
     errorMessage = "";
 
-    let thinking = "";
-    let content = "";
-    let toolCalls: ToolCallDisplay[] = [];
+    const streamModel = selectedModel;
+    const streamThink = supportsThinking ? thinkEnabled : undefined;
+    // Vision requests: image is in the message — don't offer agent tools.
+    const streamTools =
+      supportsTools && agentSettings.enabled && !hasVisionInput;
+
+    let chatHistory = upsertAgentSystemPrompt([...history], {
+      visionInput: hasVisionInput,
+    });
 
     try {
-      const unlisten = await streamChat(
-        {
-          model: selectedModel,
-          messages: history,
-          think: supportsThinking ? thinkEnabled : undefined,
-          stream: true,
-          options: includesAudio ? { num_ctx: 8192 } : undefined,
-        },
-        (chunk) => {
-          if (chunk.error) errorMessage = chunk.error;
-          if (chunk.thinking) thinking += chunk.thinking;
-          if (chunk.content) content += chunk.content;
-          if (chunk.tool_calls?.length) {
-            toolCalls = parseToolCalls(chunk.tool_calls).map((t) => ({
-              ...t,
-              status: "running" as const,
-            }));
-          }
+      ({ chatHistory } = await runAgentLoop({
+        convId,
+        chatHistory,
+        initialAssistantId: assistantId,
+        streamModel,
+        streamThink,
+        streamTools,
+        maxRounds: MAX_TOOL_ROUNDS,
+        includesAudio,
+      }));
 
-          messages = messages.map((m) =>
-            m.id === assistantId
-              ? {
-                  ...m,
-                  thinking,
-                  content,
-                  toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
-                }
-              : m,
-          );
+      setConversationHistory(convId, chatHistory);
+      syncActiveConversation(true);
 
-          if (chunk.done) isStreaming = false;
-        },
+      const finalReply = getConversationMessages(convId).find(
+        (m) => m.id === assistantId,
       );
-
-      if (toolCalls.length > 0) {
-        toolCalls = toolCalls.map((t) => ({ ...t, status: "completed" as const }));
+      if (finalReply?.content?.trim()) {
+        void maybeAutoSpeak(finalReply.content);
       }
-
-      history = [
-        ...history,
-        {
-          role: "assistant",
-          content,
-          thinking: thinking || undefined,
-          tool_calls:
-            toolCalls.length > 0
-              ? toolCalls.map((t) => ({
-                  function: { name: t.name, arguments: t.arguments },
-                }))
-              : undefined,
-        },
-      ];
-
-      messages = messages.map((m) =>
-        m.id === assistantId
-          ? {
-              ...m,
-              streaming: false,
-              toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
-            }
-          : m,
-      );
-
-      await unlisten();
     } catch (error) {
-      isStreaming = false;
-      errorMessage = String(error);
-      messages = messages.map((m) =>
-        m.id === assistantId
-          ? {
-              ...m,
-              content: "Failed to get a response.",
-              streaming: false,
-            }
-          : m,
-      );
-    }
-  }
-
-  function onKeydown(event: KeyboardEvent) {
-    if (event.key === "Enter" && !event.shiftKey) {
-      event.preventDefault();
-      void sendMessage();
+      if (convId === activeConversationId) errorMessage = String(error);
+      patchConvMessage(convId, assistantId, {
+        content: "Failed to get a response.",
+        streaming: false,
+      });
+      syncActiveConversation(true);
+    } finally {
+      activeSessions.delete(convId);
+      abortedConversations.delete(convId);
+      removeStreaming(convId);
     }
   }
 </script>
 
-<div class="shell">
-  <aside class="sidebar">
-    <div class="sidebar-brand">
-      <div class="logo">LLM</div>
-      <div>
-        <h1>Local LLM UI</h1>
-        <p class="status" class:online={connected} class:offline={!connected}>
-          <span class="status-dot"></span>
-          {statusMessage}
-        </p>
-      </div>
-    </div>
+<svelte:window onkeydown={onGlobalKeydown} />
 
-    <div class="sidebar-section">
-      <label class="field">
-        <span class="field-label">Model</span>
-        <select
-          bind:value={selectedModel}
-          disabled={!connected || isStreaming}
-        >
-          {#each models as model}
-            <option value={model.name}>
-              {model.name} ({formatBytes(model.size)})
-            </option>
-          {/each}
-        </select>
-      </label>
-
-      {#if selectedModelInfo?.capabilities.length}
-        <div class="badges">
-          {#each selectedModelInfo.capabilities as cap}
-            <span class="badge">{cap}</span>
-          {/each}
-        </div>
-      {/if}
-    </div>
-
-    <div class="sidebar-section">
-      <label class="check">
-        <input
-          type="checkbox"
-          bind:checked={thinkEnabled}
-          disabled={!supportsThinking || isStreaming}
-        />
-        Show thinking
-      </label>
-      <button
-        type="button"
-        class="btn btn-ghost"
-        onclick={refreshModels}
-        disabled={isStreaming}
-      >
-        Refresh models
-      </button>
-    </div>
-
-    <div class="sidebar-section tools-info">
-      <h2 class="section-title">Capabilities</h2>
-      <ul class="cap-list">
-        <li class:ok={supportsVision}>
-          <span>Vision</span>
-          <span>{supportsVision ? "on" : "off"}</span>
-        </li>
-        <li class:ok={supportsAudioInput}>
-          <span>Audio</span>
-          <span>{supportsAudioInput ? "30s max" : "off"}</span>
-        </li>
-        <li class:ok={supportsTools}>
-          <span>Tools / MCP</span>
-          <span>{supportsTools ? "display" : "off"}</span>
-        </li>
-      </ul>
-      {#if supportsTools}
-        <p class="hint">
-          Tool & MCP calls appear as structured cards in chat. Execution loop
-          coming in v0.3.
-        </p>
-      {/if}
-    </div>
-  </aside>
+<div class="shell" class:sidebar-collapsed={appPreferences.sidebarCollapsed}>
+  <AppSidebar
+    {conversations}
+    {activeConversationId}
+    {currentView}
+    {connected}
+    {statusMessage}
+    {chatsExpanded}
+    collapsed={appPreferences.sidebarCollapsed}
+    streamingIds={streamingIdList}
+    onNewChat={startNewChat}
+    onSelectConversation={selectConversation}
+    onDeleteConversation={deleteConversation}
+    onNavigate={navigate}
+    onToggleChats={() => (chatsExpanded = !chatsExpanded)}
+    onToggleCollapse={toggleSidebarCollapsed}
+    taggedCount={taggedMessages.length}
+  />
 
   <div class="main">
-    <div class="thread-scroll">
-      <div class="thread">
-        {#if messages.length === 0}
-          <div class="empty">
-            <h2>Chat with local models</h2>
-            <p>
-              Attach images for vision models or audio for Gemma 4. Audio
-              includes playback controls; images open in a preview lightbox.
-            </p>
-          </div>
-        {:else}
-          {#each messages as message (message.id)}
-            <div
-              class="row"
-              class:user={message.role === "user"}
-              class:assistant={message.role === "assistant"}
-            >
-              <ChatBubble
-                role={message.role}
-                content={message.content}
-                thinking={message.thinking}
-                attachments={message.attachments}
-                toolCalls={message.toolCalls}
-                streaming={message.streaming}
-                showThinking={thinkEnabled}
-              />
-            </div>
-          {/each}
-          <div bind:this={messagesEnd}></div>
+    {#if currentView === "chat"}
+      <header class="chat-header">
+        <h2>{chatTitle}</h2>
+        {#if messages.some((m) => m.content.trim() && !m.streaming)}
+          <button
+            type="button"
+            class="header-export-btn"
+            onclick={exportChatMarkdown}
+            title="Download chat as Markdown"
+            aria-label="Download chat as Markdown"
+          >
+            ↓ Export .md
+          </button>
         {/if}
-      </div>
-    </div>
+        {#if selectedModelInfo}
+          <div class="header-badges">
+            {#each selectedModelInfo.capabilities as cap}
+              <span class="badge">{cap}</span>
+            {/each}
+          </div>
+        {/if}
+      </header>
 
-    {#if errorMessage}
-      <div class="error-banner" role="alert">{errorMessage}</div>
-    {/if}
-
-    <footer class="composer">
-      <AttachmentStrip
-        items={pending}
-        onRemove={removePending}
-        disabled={isStreaming || isPreparingAudio}
-      />
-
-      {#if isPreparingAudio}
-        <p class="preparing">Converting audio to 16 kHz WAV…</p>
-      {/if}
-
-      <div class="composer-inner">
-        <div class="composer-actions">
-          {#if supportsVision}
-            <label class="btn btn-ghost attach-btn">
-              <input
-                type="file"
-                accept="image/*"
-                multiple
-                onchange={onImageSelected}
-                disabled={isStreaming || isPreparingAudio}
-              />
-              <svg width="18" height="18" viewBox="0 0 18 18" fill="currentColor" aria-hidden="true">
-                <path d="M2 4a2 2 0 012-2h8l4 4v8a2 2 0 01-2 2H4a2 2 0 01-2-2V4zm10 0v3h3M6 10l2.5-3 2 2.5L13 8" stroke="currentColor" stroke-width="1.2" fill="none"/>
-              </svg>
-              Image
-            </label>
-          {/if}
-          {#if supportsAudioInput}
-            <label class="btn btn-ghost attach-btn">
-              <input
-                type="file"
-                accept="audio/*,.mp3,.wav,.ogg,.flac,.m4a,.aac,.webm"
-                multiple
-                onchange={onAudioSelected}
-                disabled={isStreaming || isPreparingAudio}
-              />
-              <svg width="18" height="18" viewBox="0 0 18 18" fill="currentColor" aria-hidden="true">
-                <path d="M9 1a3 3 0 00-3 3v5a3 3 0 006 0V4a3 3 0 00-3-3zm-5 8a5 5 0 0010 0h2a7 7 0 01-14 0h2zm3 0H6a3 3 0 006 0h-1a2 2 0 11-4 0H7z"/>
-              </svg>
-              Audio
-            </label>
+      <div class="thread-scroll">
+        <div class="thread">
+          {#if messages.length === 0}
+            <div class="empty">
+              <h2>Chat with local models</h2>
+              <p>
+                Use <strong>+</strong> → <strong>Plan</strong> to explore read-only,
+                then run the plan from the Plan panel. Enable agent access in Settings
+                for file tools.
+              </p>
+            </div>
+          {:else}
+            {#each messages as message, index (message.id)}
+              <div
+                id="msg-{message.id}"
+                class="row"
+                class:user={message.role === "user"}
+                class:assistant={message.role === "assistant"}
+              >
+                <ChatBubble
+                  role={message.role}
+                  messageId={message.id}
+                  content={message.content}
+                  thinking={message.thinking}
+                  thinkingDurationMs={message.thinkingDurationMs}
+                  attachments={message.attachments}
+                  toolCalls={message.toolCalls}
+                  contextToolCalls={contextToolCallsForMessage(index)}
+                  streaming={message.streaming}
+                  showThinking={thinkEnabled}
+                  agentLayout={agentSettings.enabled && message.role === "assistant"}
+                  ttsEnabled={ttsSettings.enabled && kokoroDetected}
+                  speaking={speakingTtsTarget === message.id}
+                  speakingBlockKey={speakingBlockKeyFor(message.id)}
+                  onSpeak={
+                    message.role === "assistant" && message.content.trim()
+                      ? () => speakMessage(message.id, message.content)
+                      : undefined
+                  }
+                  onSpeakBlock={
+                    message.role === "assistant"
+                      ? (text, blockKey) =>
+                          speakMessageBlock(message.id, blockKey, text)
+                      : undefined
+                  }
+                  onStopSpeak={stopTts}
+                  allowBlockDownload={
+                    message.role === "assistant" &&
+                    Boolean(message.content.trim()) &&
+                    !message.streaming
+                  }
+                  tagged={
+                    activeConversationId
+                      ? isMessageTagged(
+                          taggedMessages,
+                          activeConversationId,
+                          message.id,
+                        )
+                      : false
+                  }
+                  onCopy={
+                    message.content.trim() && !message.streaming
+                      ? () => void copyToClipboard(message.content)
+                      : undefined
+                  }
+                  onBranch={
+                    !message.streaming && !isActiveStreaming
+                      ? () => branchFromMessage(index)
+                      : undefined
+                  }
+                  onToggleTag={
+                    message.content.trim() && !message.streaming
+                      ? () => toggleMessageTag(message)
+                      : undefined
+                  }
+                />
+              </div>
+            {/each}
+            <div bind:this={messagesEnd}></div>
           {/if}
         </div>
-
-        <textarea
-          class="composer-input"
-          bind:value={input}
-          placeholder={hasPendingAudio
-            ? "Optional prompt (defaults to “Transcribe this audio”)…"
-            : "Message the model…"}
-          rows="2"
-          onkeydown={onKeydown}
-          disabled={!connected || isStreaming || isPreparingAudio}
-        ></textarea>
-
-        <button
-          type="button"
-          class="btn btn-primary send-btn"
-          onclick={sendMessage}
-          disabled={!connected || isStreaming || isPreparingAudio}
-        >
-          {#if isStreaming}
-            Streaming…
-          {:else if isPreparingAudio}
-            Converting…
-          {:else}
-            Send
-          {/if}
-        </button>
       </div>
-    </footer>
+
+      {#if errorMessage}
+        <div class="error-banner" role="alert">{errorMessage}</div>
+      {/if}
+
+      <PlanPanel
+        plan={agentPlan}
+        isStreaming={isActiveStreaming}
+        onRun={executePlan}
+        onDiscard={discardPlan}
+        onPlanChange={updatePlan}
+      />
+
+      <ChatComposer
+        {input}
+        {pending}
+        {models}
+        {selectedModel}
+        {chatMode}
+        {connected}
+        isStreaming={isActiveStreaming}
+        {isPreparingAudio}
+        {supportsVision}
+        supportsAudio={supportsAudioInput}
+        {supportsTools}
+        {hasPendingAudio}
+        onInputChange={(v) => (input = v)}
+        onSend={sendMessage}
+        onRemovePending={(i) => (pending = pending.filter((_, idx) => idx !== i))}
+        onImageFiles={handleImageFiles}
+        onAudioFiles={handleAudioFiles}
+        onModelChange={setSelectedModel}
+        onModeChange={(m) => {
+          if (
+            m === "plan" &&
+            (!agentSettings.enabled || !supportsTools)
+          ) {
+            notifyToolsUnavailable("use Plan mode");
+          }
+          chatMode = m;
+        }}
+        onOpenModelsView={() => navigate("models")}
+        onOpenSettingsView={() => navigate("settings")}
+        onStop={stopStreaming}
+      />
+    {:else if currentView === "tagged"}
+      <div class="view-scroll">
+        <TaggedView
+          tags={taggedMessages}
+          onOpen={openTaggedMessage}
+          onRemove={removeTaggedMessageById}
+        />
+      </div>
+    {:else if currentView === "models"}
+      <div class="view-scroll">
+        <ModelsView
+          {models}
+          {selectedModel}
+          {connected}
+          onSelectModel={setSelectedModel}
+          onRefresh={refreshModels}
+          onStartChat={() => navigate("chat")}
+        />
+      </div>
+    {:else if currentView === "settings"}
+      <div class="view-scroll">
+        <SettingsView
+          {thinkEnabled}
+          {supportsThinking}
+          supportsVision={supportsVision}
+          supportsAudio={supportsAudioInput}
+          {supportsTools}
+          {connected}
+          isStreaming={streamingIds.size > 0}
+          {agentSettings}
+          {selectedModel}
+          toolSuggestions={toolModelSuggestions}
+          thinkingSuggestions={thinkingModelSuggestions}
+          maxConcurrentChats={appPreferences.maxConcurrentChats}
+          onThinkChange={(v) => (thinkEnabled = v)}
+          onRefresh={refreshModels}
+          onAgentChange={updateAgentSettings}
+          onAddRoot={addAgentRoot}
+          onRemoveRoot={removeAgentRoot}
+          onBrowseModels={() => navigate("models")}
+          onSelectModel={setSelectedModel}
+          onMaxConcurrentChange={(n) => updateAppPreferences({ maxConcurrentChats: n })}
+          {ttsSettings}
+          {kokoroDetected}
+          {kokoroPath}
+          {ttsBusy}
+          onTtsChange={updateTtsSettings}
+          onDetectKokoro={refreshKokoroDetect}
+          onTestTts={testTtsVoice}
+          onStopTts={stopTts}
+        />
+      </div>
+    {/if}
   </div>
 </div>
+
+<ToolApprovalModal
+  tool={pendingApproval?.tool ?? null}
+  onApprove={(remember) => handleApproval(true, remember)}
+  onDeny={() => handleApproval(false)}
+/>
+
+<PlanApprovalModal
+  plan={pendingPlanApproval?.plan ?? null}
+  onApprove={() => handlePlanApproval(true)}
+  onDeny={() => handlePlanApproval(false)}
+/>
+
+<WorkspacePromptModal
+  open={showWorkspacePrompt}
+  onChooseFolder={() => {
+    void pickWorkspaceFolder();
+  }}
+  onDismiss={() => (showWorkspacePrompt = false)}
+/>
+
+<ToastStack />
 
 <style>
   .shell {
@@ -519,174 +1891,82 @@
     width: 100vw;
     overflow: hidden;
     background: var(--color-bg);
+    transition: grid-template-columns 0.15s ease;
   }
 
-  /* Sidebar */
-  .sidebar {
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-5);
-    padding: var(--space-5);
-    background: var(--color-bg-elevated);
-    border-right: 1px solid var(--color-border);
-    overflow-y: auto;
+  .shell.sidebar-collapsed {
+    grid-template-columns: var(--sidebar-width-collapsed) 1fr;
   }
 
-  .sidebar-brand {
-    display: flex;
-    gap: var(--space-3);
-    align-items: center;
-  }
-
-  .logo {
-    width: 40px;
-    height: 40px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    border-radius: var(--radius-md);
-    background: var(--color-primary);
-    font-weight: 700;
-    font-size: var(--text-sm);
-  }
-
-  .sidebar-brand h1 {
-    margin: 0;
-    font-size: var(--text-base);
-    font-weight: 600;
-  }
-
-  .status {
-    margin: var(--space-1) 0 0;
-    display: flex;
-    align-items: center;
-    gap: var(--space-2);
-    font-size: var(--text-xs);
-    color: var(--color-text-muted);
-  }
-
-  .status-dot {
-    width: 7px;
-    height: 7px;
-    border-radius: var(--radius-full);
-    background: var(--color-text-muted);
-  }
-
-  .status.online .status-dot {
-    background: var(--color-success);
-    box-shadow: 0 0 6px var(--color-success);
-  }
-
-  .status.offline .status-dot {
-    background: var(--color-error);
-  }
-
-  .sidebar-section {
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-3);
-  }
-
-  .section-title {
-    margin: 0;
-    font-size: var(--text-xs);
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    color: var(--color-text-muted);
-  }
-
-  .field {
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-2);
-  }
-
-  .field-label {
-    font-size: var(--text-xs);
-    color: var(--color-text-secondary);
-  }
-
-  select,
-  textarea {
-    background: var(--color-bg-inset);
-    border: 1px solid var(--color-border);
-    border-radius: var(--radius-md);
-    padding: var(--space-3);
-    color: var(--color-text);
-  }
-
-  select:focus,
-  textarea:focus {
-    outline: 2px solid var(--color-primary);
-    outline-offset: 1px;
-  }
-
-  .badges {
-    display: flex;
-    flex-wrap: wrap;
-    gap: var(--space-2);
-  }
-
-  .badge {
-    font-size: var(--text-xs);
-    padding: 2px 8px;
-    border-radius: var(--radius-full);
-    background: rgba(79, 106, 245, 0.12);
-    color: #9ec5ff;
-    border: 1px solid rgba(79, 106, 245, 0.2);
-  }
-
-  .check {
-    display: flex;
-    align-items: center;
-    gap: var(--space-2);
-    font-size: var(--text-sm);
-    color: var(--color-text-secondary);
-    cursor: pointer;
-  }
-
-  .cap-list {
-    list-style: none;
-    margin: 0;
-    padding: 0;
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-2);
-  }
-
-  .cap-list li {
-    display: flex;
-    justify-content: space-between;
-    font-size: var(--text-sm);
-    color: var(--color-text-muted);
-    padding: var(--space-2) var(--space-3);
-    border-radius: var(--radius-sm);
-    background: var(--color-bg-inset);
-  }
-
-  .cap-list li.ok span:last-child {
-    color: var(--color-success);
-  }
-
-  .tools-info {
-    margin-top: auto;
-  }
-
-  .hint {
-    margin: 0;
-    font-size: var(--text-xs);
-    color: var(--color-text-muted);
-    line-height: 1.4;
-  }
-
-  /* Main chat */
   .main {
     display: flex;
     flex-direction: column;
     min-width: 0;
     min-height: 0;
+    height: 100%;
+    overflow: hidden;
     background: var(--color-bg);
+  }
+
+  .view-scroll {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    overflow-x: hidden;
+  }
+
+  .chat-header {
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    padding: var(--space-4) var(--space-4) var(--space-2);
+    border-bottom: 1px solid var(--color-border-subtle);
+    max-width: calc(var(--thread-max-width) + var(--space-8) * 2);
+    margin: 0 auto;
+    width: 100%;
+  }
+
+  .chat-header h2 {
+    margin: 0;
+    font-size: var(--text-base);
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1;
+    min-width: 0;
+  }
+
+  .header-export-btn {
+    flex-shrink: 0;
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-sm);
+    background: var(--color-bg-inset);
+    color: var(--color-text-secondary);
+    font-size: var(--text-xs);
+    padding: 4px 10px;
+    cursor: pointer;
+  }
+
+  .header-export-btn:hover {
+    color: var(--color-text);
+    border-color: var(--color-primary);
+  }
+
+  .header-badges {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-1);
+    flex-shrink: 0;
+  }
+
+  .badge {
+    font-size: 0.65rem;
+    padding: 2px 6px;
+    border-radius: var(--radius-full);
+    background: rgba(79, 106, 245, 0.12);
+    color: #9ec5ff;
   }
 
   .thread-scroll {
@@ -703,6 +1983,11 @@
     flex-direction: column;
     gap: var(--space-4);
     width: 100%;
+    min-height: 100%;
+  }
+
+  .thread :global(.alert) {
+    margin-bottom: var(--space-2);
   }
 
   .row {
@@ -710,17 +1995,8 @@
     width: 100%;
   }
 
-  .row.user {
-    justify-content: flex-end;
-  }
-
-  .row.assistant {
-    justify-content: flex-start;
-  }
-
-  .row :global(.bubble) {
-    max-width: 100%;
-  }
+  .row.user { justify-content: flex-end; }
+  .row.assistant { justify-content: flex-start; }
 
   .row.user :global(.bubble) {
     max-width: min(100%, 560px);
@@ -736,7 +2012,6 @@
   .empty h2 {
     margin: 0 0 var(--space-3);
     font-size: var(--text-lg);
-    font-weight: 600;
   }
 
   .empty p {
@@ -755,95 +2030,9 @@
     border: 1px solid rgba(248, 113, 113, 0.35);
     color: var(--color-error);
     font-size: var(--text-sm);
-  }
-
-  /* Composer */
-  .composer {
-    flex-shrink: 0;
-    padding: var(--space-4);
-    border-top: 1px solid var(--color-border);
-    background: var(--color-bg-elevated);
-  }
-
-  .composer-inner {
-    display: grid;
-    grid-template-columns: auto 1fr auto;
-    gap: var(--space-3);
-    align-items: flex-end;
     max-width: calc(var(--thread-max-width) + var(--space-8) * 2);
-    margin: 0 auto;
-  }
-
-  .composer-actions {
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-2);
-  }
-
-  .composer-input {
-    resize: none;
-    min-height: 52px;
-    max-height: 160px;
-    line-height: 1.5;
-  }
-
-  .preparing {
-    max-width: calc(var(--thread-max-width) + var(--space-8) * 2);
-    margin: 0 auto var(--space-2);
-    font-size: var(--text-sm);
-    color: var(--color-tool);
-  }
-
-  /* Buttons */
-  .btn {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    gap: var(--space-2);
-    padding: var(--space-2) var(--space-4);
-    border-radius: var(--radius-md);
-    border: 1px solid transparent;
-    font-size: var(--text-sm);
-    font-weight: 500;
-    white-space: nowrap;
-  }
-
-  .btn-primary {
-    background: var(--color-primary);
-    color: white;
-    border-color: var(--color-primary);
-    min-width: 88px;
-    padding: var(--space-3) var(--space-5);
-  }
-
-  .btn-primary:hover:not(:disabled) {
-    background: var(--color-primary-hover);
-  }
-
-  .btn-ghost {
-    background: var(--color-bg-inset);
-    border-color: var(--color-border);
-    color: var(--color-text-secondary);
-  }
-
-  .btn-ghost:hover:not(:disabled) {
-    background: var(--color-bg-hover);
-    color: var(--color-text);
-  }
-
-  .attach-btn {
-    cursor: pointer;
-    position: relative;
-  }
-
-  .attach-btn input {
-    position: absolute;
-    width: 0;
-    height: 0;
-    opacity: 0;
-  }
-
-  .send-btn {
-    align-self: stretch;
+    margin-left: auto;
+    margin-right: auto;
+    width: calc(100% - var(--space-8));
   }
 </style>

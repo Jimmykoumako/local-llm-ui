@@ -1,5 +1,10 @@
 <script lang="ts">
+  import SearchResultTable from "./SearchResultTable.svelte";
   import type { ToolCallDisplay } from "$lib/types";
+  import {
+    parseSearchContentResult,
+    parseSearchFilesResult,
+  } from "$lib/utils/tool-results";
   import { formatToolArguments } from "$lib/utils/tools";
 
   interface Props {
@@ -28,6 +33,8 @@
           <code class="name">{tool.name}</code>
           {#if tool.source === "mcp"}
             <span class="badge mcp">MCP</span>
+          {:else if tool.source === "agent"}
+            <span class="badge agent">Files</span>
           {:else}
             <span class="badge ollama">Ollama</span>
           {/if}
@@ -39,7 +46,25 @@
         {#if tool.result}
           <div class="result">
             <span class="result-label">Result</span>
-            <pre>{tool.result}</pre>
+            {#if tool.name === "search_files" && tool.status === "completed" && parseSearchFilesResult(tool.result)}
+              <div class="result-table">
+                <SearchResultTable toolName="search_files" result={tool.result} />
+              </div>
+              <details class="raw-result">
+                <summary>Raw JSON</summary>
+                <pre>{tool.result}</pre>
+              </details>
+            {:else if tool.name === "search_content" && tool.status === "completed" && parseSearchContentResult(tool.result)}
+              <div class="result-table">
+                <SearchResultTable toolName="search_content" result={tool.result} />
+              </div>
+              <details class="raw-result">
+                <summary>Raw JSON</summary>
+                <pre>{tool.result}</pre>
+              </details>
+            {:else}
+              <pre>{tool.result}</pre>
+            {/if}
           </div>
         {/if}
       </li>
@@ -128,6 +153,11 @@
     color: var(--color-tool);
   }
 
+  .badge.agent {
+    background: rgba(74, 222, 128, 0.12);
+    color: var(--color-success);
+  }
+
   .status {
     margin-left: auto;
     font-size: var(--text-xs);
@@ -163,5 +193,25 @@
     font-size: var(--text-xs);
     color: var(--color-success);
     margin-bottom: var(--space-1);
+  }
+
+  .result-table {
+    margin-bottom: var(--space-2);
+    overflow-x: auto;
+  }
+
+  .raw-result {
+    margin-top: var(--space-2);
+  }
+
+  .raw-result summary {
+    cursor: pointer;
+    font-size: var(--text-xs);
+    color: var(--color-text-muted);
+    margin-bottom: var(--space-1);
+  }
+
+  .raw-result pre {
+    margin-top: var(--space-1);
   }
 </style>
