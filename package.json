@@ -1,6 +1,6 @@
 {
   "name": "local-llm-ui",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A lightweight desktop UI for Ollama",
   "type": "module",
   "scripts": {

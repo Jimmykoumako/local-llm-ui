@@ -56,6 +56,7 @@
   import PlanPanel from "$lib/components/PlanPanel.svelte";
   import ToolApprovalModal from "$lib/components/ToolApprovalModal.svelte";
   import WorkspacePromptModal from "$lib/components/WorkspacePromptModal.svelte";
+  import OllamaSetupModal from "$lib/components/OllamaSetupModal.svelte";
   import { truncateHistoryToMessages } from "$lib/branch-conversation";
   import { copyToClipboard } from "$lib/utils/clipboard";
   import {
@@ -107,6 +108,13 @@
     saveAppPreferences,
     saveLastModel,
   } from "$lib/preferences";
+  import {
+    applyOllamaHost,
+    loadOllamaHost,
+    loadOllamaSetupDismissed,
+    saveOllamaSetupDismissed,
+    syncOllamaHostFromStorage,
+  } from "$lib/ollama-settings";
   import { wavBase64ToUrl } from "$lib/utils/audio";
   import { parseToolCalls, toolCallsForOllamaHistory } from "$lib/utils/tools";
 
@@ -148,6 +156,9 @@
     resolve: (ok: boolean) => void;
   } | null>(null);
   let showWorkspacePrompt = $state(false);
+  let ollamaHost = $state(loadOllamaHost());
+  let showOllamaSetup = $state(false);
+  let ollamaCheckBusy = $state(false);
   let ttsSettings = $state<TtsSettings>(loadTtsSettings());
   let kokoroDetected = $state(false);
   let kokoroPath = $state("");
@@ -368,7 +379,9 @@
   }
 
   async function refreshModels() {
+    ollamaCheckBusy = true;
     try {
+      ollamaHost = await applyOllamaHost(ollamaHost);
       await checkOllama();
       connected = true;
       statusMessage = "Connected to Ollama";
@@ -382,12 +395,35 @@
         setSelectedModel(next);
       }
       errorMessage = "";
+      showOllamaSetup = false;
     } catch (error) {
       connected = false;
       statusMessage = "Ollama not reachable";
       errorMessage = String(error);
       models = [];
+      if (!loadOllamaSetupDismissed()) {
+        showOllamaSetup = true;
+      }
+    } finally {
+      ollamaCheckBusy = false;
     }
+  }
+
+  async function retryOllamaSetup() {
+    await refreshModels();
+    if (connected) {
+      saveOllamaSetupDismissed(true);
+    }
+  }
+
+  function dismissOllamaSetup() {
+    showOllamaSetup = false;
+    saveOllamaSetupDismissed(true);
+  }
+
+  function openOllamaSettings() {
+    showOllamaSetup = false;
+    currentView = "settings";
   }
 
   function syncActiveConversation(finalize = false) {
@@ -606,9 +642,19 @@
   }
 
   let conversationsHydrated = false;
+  let connectionInitialized = false;
 
   $effect(() => {
-    refreshModels();
+    if (connectionInitialized) return;
+    connectionInitialized = true;
+    void (async () => {
+      try {
+        ollamaHost = await syncOllamaHostFromStorage();
+      } catch {
+        // Keep stored host; refreshModels will surface errors.
+      }
+      await refreshModels();
+    })();
   });
 
   $effect(() => {
@@ -1833,6 +1879,7 @@
           supportsAudio={supportsAudioInput}
           {supportsTools}
           {connected}
+          {ollamaHost}
           isStreaming={streamingIds.size > 0}
           {agentSettings}
           {selectedModel}
@@ -1841,6 +1888,7 @@
           maxConcurrentChats={appPreferences.maxConcurrentChats}
           onThinkChange={(v) => (thinkEnabled = v)}
           onRefresh={refreshModels}
+          onOllamaHostChange={(value) => (ollamaHost = value)}
           onAgentChange={updateAgentSettings}
           onAddRoot={addAgentRoot}
           onRemoveRoot={removeAgentRoot}
@@ -1879,6 +1927,17 @@
     void pickWorkspaceFolder();
   }}
   onDismiss={() => (showWorkspacePrompt = false)}
+/>
+
+<OllamaSetupModal
+  open={showOllamaSetup}
+  host={ollamaHost}
+  error={errorMessage}
+  busy={ollamaCheckBusy}
+  onHostChange={(value) => (ollamaHost = value)}
+  onRetry={retryOllamaSetup}
+  onOpenSettings={openOllamaSettings}
+  onDismiss={dismissOllamaSetup}
 />
 
 <ToastStack />

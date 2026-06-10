@@ -1,56 +1,73 @@
 # Local LLM UI
 
-A lightweight Linux desktop app for chatting with [Ollama](https://ollama.com) models. Built with **Rust + Tauri 2** and **SvelteKit**.
+A cross-platform desktop app for chatting with [Ollama](https://ollama.com) models. Built with **Rust + Tauri 2** and **SvelteKit**.
+
+**You install Ollama yourself** — this app is the UI and agent layer only.
 
 ## Features
 
-- Connect to a local Ollama instance (`http://127.0.0.1:11434`)
+- Connect to your Ollama instance (default `http://127.0.0.1:11434`, configurable)
 - List installed models with capability badges (`vision`, `tools`, `thinking`)
 - Stream chat responses in real time
 - Show model **thinking** in a separate collapsible section
 - Attach **images** for vision-capable models
 - Attach **audio** for Gemma 4-style models (auto-converted to 16 kHz mono WAV via ffmpeg)
-- Display **tool calls** returned by the model (execution loop coming next)
+- **Agent tools** — filesystem, git, and terminal access with approvals
+- **Kokoro TTS** — optional read-aloud (desktop)
+- Multiple conversations, tagging, and export
 
-## Prerequisites (Linux)
+## Quick start (end users)
 
-1. **Rust** — install via [rustup](https://rustup.rs/):
-
+1. Install [Ollama](https://ollama.com/download) and pull a model:
    ```bash
-   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-   source "$HOME/.cargo/env"
-   ```
-
-2. **Tauri Linux dependencies** — see [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/#linux):
-
-   ```bash
-   sudo apt update
-   sudo apt install -y \
-     libwebkit2gtk-4.1-dev \
-     build-essential \
-     curl \
-     wget \
-     file \
-     libssl-dev \
-     libayatana-appindicator3-dev \
-     librsvg2-dev
-   ```
-
-3. **Ollama** — running locally with at least one model pulled:
-
-   ```bash
-   ollama serve
    ollama pull qwen3
-   ollama pull gemma4   # for audio input
    ```
+2. Download the latest installer for your OS from [GitHub Releases](https://github.com/Jimmykoumako/local-llm-ui/releases).
+3. Open Local LLM UI and confirm **Settings → Connection**.
 
-4. **ffmpeg** (optional) — preferred for audio conversion; the app falls back to built-in Rust decoding if ffmpeg is missing:
+See [docs/RELEASE.md](./docs/RELEASE.md) for per-platform notes.
 
-   ```bash
-   sudo apt install ffmpeg
-   ```
+## Prerequisites (development)
 
-5. **Node.js** — v18+ (you already have this)
+### All platforms
+
+- **Rust** — [rustup](https://rustup.rs/)
+- **Node.js** — v18+
+- **Ollama** — running locally
+
+### Linux
+
+[Tauri prerequisites](https://v2.tauri.app/start/prerequisites/#linux):
+
+```bash
+sudo apt update
+sudo apt install -y \
+  libwebkit2gtk-4.1-dev \
+  build-essential \
+  curl \
+  wget \
+  file \
+  libssl-dev \
+  libayatana-appindicator3-dev \
+  librsvg2-dev
+```
+
+### Windows
+
+- [Microsoft C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
+- [Tauri Windows prerequisites](https://v2.tauri.app/start/prerequisites/#windows)
+- WebView2 (usually preinstalled on Windows 11)
+
+### macOS
+
+- Xcode Command Line Tools: `xcode-select --install`
+- [Tauri macOS prerequisites](https://v2.tauri.app/start/prerequisites/#macos)
+
+### Optional
+
+- **ffmpeg** — preferred audio conversion; Rust fallback if missing
+- **git** — agent git tools
+- **Kokoro** — Settings → Speech
 
 ## Development
 
@@ -59,52 +76,47 @@ npm install
 npm run tauri dev
 ```
 
+Override Ollama URL for testing:
+
+```bash
+OLLAMA_HOST=http://127.0.0.1:11434 npm run tauri dev
+```
+
 ## Build
 
 ```bash
 npm run tauri build
 ```
 
-The binary and `.deb`/`.AppImage` will be in `src-tauri/target/release/bundle/`.
+Installers are written to `src-tauri/target/release/bundle/`.
 
-## Versioning
+## Releases
 
-This project uses [Semantic Versioning](https://semver.org/) and documents releases in [CHANGELOG.md](./CHANGELOG.md).
-
-See [docs/BRANCHING.md](./docs/BRANCHING.md) for the branch workflow (`main` = production, `dev` = integration, `feature/*` = work in progress).
-
-Planned features: [docs/ROADMAP.md](./docs/ROADMAP.md) · UI mockup prompts: [docs/stitch-prompts.md](./docs/stitch-prompts.md)
+Tag-driven builds for Windows, Linux, and macOS:
 
 ```bash
-# Tag a release after updating version in package.json, Cargo.toml, and CHANGELOG
 git tag -a v0.1.0 -m "v0.1.0"
 git push origin v0.1.0
 ```
 
+Details: [docs/RELEASE.md](./docs/RELEASE.md)
+
+## Versioning
+
+[Semantic Versioning](https://semver.org/) · [CHANGELOG.md](./CHANGELOG.md) · [docs/BRANCHING.md](./docs/BRANCHING.md)
+
+Planned features: [docs/ROADMAP.md](./docs/ROADMAP.md)
+
 ## Architecture
 
 ```
-Svelte UI  --invoke/listen-->  Rust (Tauri)  --HTTP-->  Ollama API
+Svelte UI  --invoke/listen-->  Rust (Tauri)  --HTTP-->  Ollama API (user's machine)
+                                    |
+                            fs / git / shell / TTS
 ```
 
-- `ollama_list_models` — fetches `/api/tags` (+ `/api/show` for capabilities)
+- `ollama_set_host` / `ollama_check` — configurable Ollama base URL
+- `ollama_list_models` — `/api/tags` (+ `/api/show` for capabilities)
 - `ollama_chat` — streams `/api/chat` and emits `chat-chunk` events
-- `prepare_audio_for_ollama` — converts audio to 16 kHz mono WAV (ffmpeg first, Rust fallback), trims to 30s
-- Frontend accumulates `thinking`, `content`, and `tool_calls` per message
-
-### Audio input
-
-Ollama accepts audio through the `images` field for models like **Gemma 4**. The app:
-
-1. Lets you attach `.mp3`, `.wav`, `.ogg`, etc.
-2. Converts to **16 kHz mono WAV** using **ffmpeg** when available, otherwise **built-in Rust** (symphonia)
-3. Trims clips longer than **30 seconds** (Gemma 4 limit)
-4. Sends the WAV as base64 in `images` with `num_ctx: 8192`
-5. Defaults the prompt to *"Transcribe this audio"* if you only attach audio
-
-## Next steps
-
-- Tool execution agent loop (run tools, send `role: "tool"` results back)
-- Model settings (temperature, system prompt)
-- Chat history persistence
-- Custom Ollama host/port setting
+- `agent_execute_tool` — filesystem, git, and terminal tools inside allowed roots
+- `prepare_audio_for_ollama` — 16 kHz mono WAV (ffmpeg first, Rust fallback), max 30s

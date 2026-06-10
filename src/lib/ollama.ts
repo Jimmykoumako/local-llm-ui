@@ -7,6 +7,14 @@ import type {
   ModelInfo,
 } from "./types";
 
+export async function getOllamaHost(): Promise<string> {
+  return invoke<string>("ollama_get_host");
+}
+
+export async function setOllamaHost(host: string): Promise<string> {
+  return invoke<string>("ollama_set_host", { host });
+}
+
 export async function checkOllama(): Promise<void> {
   await invoke("ollama_check");
 }
