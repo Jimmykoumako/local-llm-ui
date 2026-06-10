@@ -3,10 +3,9 @@ use reqwest::Client;
 use tauri::{Emitter, Window};
 use tokio::select;
 
+use super::config::get_host;
 use super::sessions::{cancel as cancel_session, register, remove};
 use super::types::{parse_stream_line, ChatChunk, ChatRequest, ModelInfo, ShowResponse, TagsResponse};
-
-const OLLAMA_BASE: &str = "http://127.0.0.1:11434";
 
 fn format_chat_error(status: u16, body: &str) -> String {
     if body.contains("exceed_context_size_error") || body.contains("exceeds the available context size")
@@ -28,11 +27,12 @@ pub fn cancel_chat(session_id: String) -> Result<(), String> {
 }
 
 pub async fn check_connection() -> Result<(), String> {
+    let base = get_host();
     Client::new()
-        .get(format!("{OLLAMA_BASE}/api/tags"))
+        .get(format!("{base}/api/tags"))
         .send()
         .await
-        .map_err(|e| format!("Cannot reach Ollama at {OLLAMA_BASE}: {e}"))?
+        .map_err(|e| format!("Cannot reach Ollama at {base}: {e}"))?
         .error_for_status()
         .map_err(|e| format!("Ollama returned an error: {e}"))?;
     Ok(())
@@ -41,7 +41,7 @@ pub async fn check_connection() -> Result<(), String> {
 pub async fn list_models() -> Result<Vec<ModelInfo>, String> {
     let client = Client::new();
     let response = client
-        .get(format!("{OLLAMA_BASE}/api/tags"))
+        .get(format!("{}/api/tags", get_host()))
         .send()
         .await
         .map_err(|e| format!("Cannot reach Ollama: {e}"))?
@@ -72,7 +72,7 @@ pub async fn list_models() -> Result<Vec<ModelInfo>, String> {
 
 async fn fetch_capabilities(client: &Client, model: &str) -> Result<Vec<String>, String> {
     let response = client
-        .post(format!("{OLLAMA_BASE}/api/show"))
+        .post(format!("{}/api/show", get_host()))
         .json(&serde_json::json!({ "model": model }))
         .send()
         .await
@@ -109,7 +109,7 @@ pub async fn stream_chat(window: Window, request: ChatRequest) -> Result<(), Str
 
     let client = Client::new();
     let response = client
-        .post(format!("{OLLAMA_BASE}/api/chat"))
+        .post(format!("{}/api/chat", get_host()))
         .json(&request)
         .send()
         .await

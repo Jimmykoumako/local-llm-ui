@@ -1,3 +1,5 @@
+use crate::platform;
+
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::Serialize;
 use std::io::Write;
@@ -224,17 +226,8 @@ fn resolve_python_for_kokoro(kokoro_path: &str) -> Option<String> {
     }
 
     for cmd in ["python3", "python"] {
-        if let Ok(output) = Command::new("sh")
-            .arg("-c")
-            .arg(format!("command -v {cmd} 2>/dev/null"))
-            .output()
-        {
-            if output.status.success() {
-                let found = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if Path::new(&found).is_file() {
-                    return Some(found);
-                }
-            }
+        if let Some(found) = platform::which_executable(cmd) {
+            return Some(found);
         }
     }
 
@@ -258,29 +251,15 @@ fn resolve_kokoro_path(custom_path: &str) -> Option<String> {
         return Some(path);
     }
 
-    if let Ok(output) = Command::new("sh")
-        .arg("-c")
-        .arg("command -v kokoro 2>/dev/null")
-        .output()
-    {
-        if output.status.success() {
-            let found = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if let Some(path) = check_executable(&found) {
-                return Some(path);
-            }
+    if let Some(found) = platform::which_executable("kokoro") {
+        if let Some(path) = check_executable(&found) {
+            return Some(path);
         }
     }
 
-    if let Ok(home) = std::env::var("HOME") {
-        let candidates = [
-            format!("{home}/.local/bin/kokoro"),
-            format!("{home}/.venv/bin/kokoro"),
-            format!("{home}/Documents/non-ollama/.venv/bin/kokoro"),
-        ];
-        for candidate in candidates {
-            if let Some(path) = check_executable(&candidate) {
-                return Some(path);
-            }
+    for candidate in platform::kokoro_search_paths() {
+        if let Some(path) = check_executable(&candidate) {
+            return Some(path);
         }
     }
 
@@ -292,21 +271,12 @@ fn check_executable(path: &str) -> Option<String> {
     if trimmed.is_empty() {
         return None;
     }
-    let expanded = expand_home(trimmed);
+    let expanded = platform::expand_home(trimmed);
     let p = Path::new(&expanded);
     if p.is_file() {
         return Some(expanded);
     }
     None
-}
-
-fn expand_home(path: &str) -> String {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return format!("{home}/{rest}");
-        }
-    }
-    path.to_string()
 }
 
 #[cfg(test)]

@@ -2,14 +2,31 @@ mod audio;
 mod fs;
 mod git;
 mod ollama;
+mod platform;
 mod shell;
 mod tts;
 
 use audio::AudioPrepareResult;
 use ollama::{
-    cancel_chat, check_connection, list_models, stream_chat, ChatRequest, ModelInfo,
+    cancel_chat, check_connection, get_host, list_models, normalize_host, set_host, stream_chat,
+    ChatRequest, ModelInfo,
 };
 use tauri::Window;
+
+#[tauri::command]
+fn ollama_get_host() -> String {
+    get_host()
+}
+
+#[tauri::command]
+fn ollama_set_host(host: String) -> Result<String, String> {
+    set_host(&host)
+}
+
+#[tauri::command]
+fn ollama_normalize_host(host: String) -> Result<String, String> {
+    normalize_host(&host)
+}
 
 #[tauri::command]
 async fn ollama_check() -> Result<(), String> {
@@ -84,6 +101,9 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
+            ollama_get_host,
+            ollama_set_host,
+            ollama_normalize_host,
             ollama_check,
             ollama_list_models,
             ollama_chat,

@@ -1,6 +1,8 @@
 mod ops;
 mod permissions;
 
+use crate::platform;
+
 use permissions::{
     allowed_for_level, canonicalize_within_roots, is_destructive_operation, is_write_operation,
     resolve_cwd, resolve_within_roots, FsAuthConfig,
@@ -10,10 +12,9 @@ use serde_json::Value;
 #[tauri::command]
 pub fn agent_get_default_roots() -> Vec<String> {
     let mut roots = Vec::new();
-    if let Ok(home) = std::env::var("HOME") {
+    if let Some(home) = platform::home_dir() {
         roots.push(home.clone());
-        let docs = format!("{home}/Documents");
-        if std::path::Path::new(&docs).exists() {
+        if let Some(docs) = platform::documents_dir() {
             roots.push(docs);
         }
     }

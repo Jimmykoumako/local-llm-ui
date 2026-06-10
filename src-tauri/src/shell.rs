@@ -25,13 +25,7 @@ pub fn run_terminal(
     let cwd_owned = cwd.to_path_buf();
     let start = Instant::now();
 
-    let handle = thread::spawn(move || {
-        Command::new("sh")
-            .arg("-c")
-            .arg(&command_owned)
-            .current_dir(&cwd_owned)
-            .output()
-    });
+    let handle = thread::spawn(move || run_shell_command(&command_owned, &cwd_owned));
 
     while !handle.is_finished() {
         if start.elapsed() > Duration::from_secs(timeout) {
@@ -54,6 +48,25 @@ pub fn run_terminal(
         "duration_ms": start.elapsed().as_millis(),
     })
     .to_string())
+}
+
+fn run_shell_command(command: &str, cwd: &Path) -> std::io::Result<std::process::Output> {
+    #[cfg(windows)]
+    {
+        Command::new("cmd")
+            .args(["/C", command])
+            .current_dir(cwd)
+            .output()
+    }
+
+    #[cfg(not(windows))]
+    {
+        Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .current_dir(cwd)
+            .output()
+    }
 }
 
 fn truncate_output(mut text: String) -> String {

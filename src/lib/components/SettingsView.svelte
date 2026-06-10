@@ -20,10 +20,12 @@
     supportsAudio: boolean;
     supportsTools: boolean;
     connected: boolean;
+    ollamaHost: string;
     isStreaming: boolean;
     agentSettings: AgentSettings;
     onThinkChange: (value: boolean) => void;
     onRefresh: () => void;
+    onOllamaHostChange: (value: string) => void;
     onAgentChange: (settings: AgentSettings) => void;
     onAddRoot: () => void;
     onRemoveRoot: (index: number) => void;
@@ -52,6 +54,7 @@
   const supportsAudio = $derived(props.supportsAudio);
   const supportsTools = $derived(props.supportsTools);
   const connected = $derived(props.connected);
+  const ollamaHost = $derived(props.ollamaHost);
   const isStreaming = $derived(props.isStreaming);
   const agentSettings = $derived(props.agentSettings);
   const selectedModel = $derived(props.selectedModel);
@@ -236,7 +239,20 @@
       onToggle={() => toggleSection("connection")}
       hidden={!isSectionVisible("connection")}
     >
-      <p class="desc">Ollama runs locally at <code>http://127.0.0.1:11434</code></p>
+      <p class="desc">
+        Point the app at your Ollama API. Install Ollama separately, then use the default
+        <code>http://127.0.0.1:11434</code> or a custom host/port (e.g. WSL or LAN).
+      </p>
+      <label class="field">
+        <span>Ollama URL</span>
+        <input
+          type="url"
+          value={ollamaHost}
+          placeholder="http://127.0.0.1:11434"
+          disabled={isStreaming}
+          oninput={(e) => props.onOllamaHostChange(e.currentTarget.value)}
+        />
+      </label>
       <div class="row">
         <span>Status</span>
         <span class:ok={connected} class:bad={!connected}>
@@ -244,7 +260,7 @@
         </span>
       </div>
       <button type="button" class="btn" onclick={props.onRefresh} disabled={isStreaming}>
-        Test connection
+        Save &amp; test connection
       </button>
     </SettingsSection>
 
@@ -857,6 +873,7 @@
 
   .field select,
   .field input[type="text"],
+  .field input[type="url"],
   .field input[type="number"] {
     padding: var(--space-2) var(--space-3);
     border-radius: var(--radius-sm);
